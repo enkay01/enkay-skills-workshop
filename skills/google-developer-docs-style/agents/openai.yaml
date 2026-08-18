@@ -1,0 +1,4 @@
+interface:
+  display_name: "Google developer docs style"
+  short_description: "Review and draft clear developer documentation"
+  default_prompt: "Use $google-developer-docs-style to review this developer documentation for clarity, accessibility, and consistency."
