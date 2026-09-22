@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "fast-tools hook-pre",
+            "command": "~/.local/bin/fast-tools hook-pre",
             "timeout": 5
           }
         ]
@@ -18,8 +18,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "fast-tools hook-post",
-            "timeout": 15
+            "command": "~/.local/bin/fast-tools hook-post",
+            "timeout": 5
           }
         ]
       }

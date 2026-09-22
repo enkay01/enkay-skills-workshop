@@ -228,3 +228,60 @@ fn test_hook_router_pre_tool_contract() {
     let new_cmd = overwrite.get("CommandLine").and_then(|v| v.as_str()).unwrap();
     assert_eq!(new_cmd, "fast-tools git-snapshot");
 }
+
+#[test]
+fn test_hook_router_intercepts_cat() {
+    let raw_input = json!({
+        "toolCall": {
+            "name": "run_command",
+            "args": {
+                "CommandLine": "cat src/lib.rs"
+            }
+        },
+        "stepIdx": 10
+    }).to_string();
+
+    let response = route_pre_tool(&raw_input);
+    assert_eq!(response.decision, "allow");
+    assert!(response.overwrite.is_some());
+    let new_cmd = response.overwrite.unwrap().get("CommandLine").and_then(|v| v.as_str()).unwrap().to_string();
+    assert_eq!(new_cmd, "fast-tools view src/lib.rs");
+}
+
+#[test]
+fn test_hook_router_intercepts_lsof() {
+    let raw_input = json!({
+        "toolCall": {
+            "name": "run_command",
+            "args": {
+                "CommandLine": "lsof -p 12345"
+            }
+        },
+        "stepIdx": 11
+    }).to_string();
+
+    let response = route_pre_tool(&raw_input);
+    assert_eq!(response.decision, "allow");
+    assert!(response.overwrite.is_some());
+    let new_cmd = response.overwrite.unwrap().get("CommandLine").and_then(|v| v.as_str()).unwrap().to_string();
+    assert_eq!(new_cmd, "fast-tools poll --pid 12345 --state alive --timeout 5000");
+}
+
+#[test]
+fn test_hook_router_intercepts_os_kill_python() {
+    let raw_input = json!({
+        "toolCall": {
+            "name": "run_command",
+            "args": {
+                "CommandLine": "python3 -c \"import os; os.kill(7788, 0)\""
+            }
+        },
+        "stepIdx": 12
+    }).to_string();
+
+    let response = route_pre_tool(&raw_input);
+    assert_eq!(response.decision, "allow");
+    assert!(response.overwrite.is_some());
+    let new_cmd = response.overwrite.unwrap().get("CommandLine").and_then(|v| v.as_str()).unwrap().to_string();
+    assert_eq!(new_cmd, "fast-tools poll --pid 7788 --state alive --timeout 5000");
+}

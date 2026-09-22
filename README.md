@@ -23,7 +23,11 @@ Run the installation script:
 ./install.sh
 ```
 
-This compiles the release binaries, copies `fast-tools` and `view-file` into `~/.local/bin/`, and registers `fast-tools` and `fast-view` inside `~/.gemini/config/mcp_config.json`.
+This single command sets up the complete developer environment:
+- Compiles `fast-tools` and `view-file` in release mode and copies them to `~/.local/bin/`.
+- Registers the `fast-tools` and `fast-view` servers in `~/.gemini/config/mcp_config.json`.
+- Merges the `fast-tools-optimizer` hook into `~/.gemini/config/hooks.json` to transparently rewrite `git status`, `cat`, and process polling commands.
+- Injects global agent rules into `~/.gemini/GEMINI.md` and `~/.gemini/AGENTS.md` so models use batch reading, context search, transactional editing, and process polling by default.
 
 ### 2. Testing
 

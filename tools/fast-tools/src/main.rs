@@ -2,11 +2,11 @@ use clap::{Parser, Subcommand};
 use fast_tools::edit::{edit_and_verify, EditParams};
 use fast_tools::git::get_working_tree_snapshot;
 use fast_tools::grep::search_context;
-use fast_tools::hooks::{route_post_tool, route_pre_tool};
+use fast_tools::hooks::route_pre_tool;
 use fast_tools::mcp::run_mcp_server;
 use fast_tools::poll::{poll_service, PollConfig, TargetState};
 use fast_tools::view::{view_batch_files, view_single_file, ViewOptions};
-use std::io::{self, Read};
+use std::io;
 use std::path::PathBuf;
 use std::process;
 
@@ -271,17 +271,23 @@ fn main() {
         }
 
         Some(Commands::HookPre) => {
-            let mut input = String::new();
-            let _ = io::stdin().read_to_string(&mut input);
-            let resp = route_pre_tool(&input);
+            let stream = serde_json::Deserializer::from_reader(io::stdin().lock()).into_iter::<serde_json::Value>();
+            let mut resp = fast_tools::hooks::PreToolResponse {
+                decision: "allow".to_string(),
+                reason: None,
+                overwrite: None,
+            };
+            for val in stream {
+                if let Ok(v) = val {
+                    resp = route_pre_tool(&v.to_string());
+                    break;
+                }
+            }
             println!("{}", serde_json::to_string(&resp).unwrap_or_default());
         }
 
         Some(Commands::HookPost) => {
-            let mut input = String::new();
-            let _ = io::stdin().read_to_string(&mut input);
-            let resp = route_post_tool(&input);
-            println!("{}", serde_json::to_string(&resp).unwrap_or_default());
+            println!("{{}}");
         }
 
         None => {
