@@ -6,59 +6,44 @@ BIN_DIR="${HOME}/.local/bin"
 GEMINI_DIR="${HOME}/.gemini"
 GEMINI_CONFIG_DIR="${GEMINI_DIR}/config"
 
-echo "Building fast-tools and view-file in release mode..."
-cargo build --release --manifest-path "${SCRIPT_DIR}/tools/fast-tools/Cargo.toml"
+echo "Building fast-tools in release mode..."
+cargo build --release --bin fast-tools --manifest-path "${SCRIPT_DIR}/tools/fast-tools/Cargo.toml"
 
 mkdir -p "${BIN_DIR}"
-echo "Installing binaries to ${BIN_DIR}..."
+echo "Installing fast-tools to ${BIN_DIR}..."
 cp "${SCRIPT_DIR}/tools/fast-tools/target/release/fast-tools" "${BIN_DIR}/fast-tools"
-cp "${SCRIPT_DIR}/tools/fast-tools/target/release/view-file" "${BIN_DIR}/view-file"
-chmod +x "${BIN_DIR}/fast-tools" "${BIN_DIR}/view-file"
+chmod +x "${BIN_DIR}/fast-tools"
 
-echo "Registering fast-tools in MCP configuration..."
-mkdir -p "${GEMINI_CONFIG_DIR}"
+# Clean up legacy view-file binary if present
+if [ -f "${BIN_DIR}/view-file" ]; then
+    rm -f "${BIN_DIR}/view-file"
+    echo "Removed legacy ${BIN_DIR}/view-file"
+fi
+
+# Clean up redundant MCP servers from mcp_config.json
 MCP_CONFIG="${GEMINI_CONFIG_DIR}/mcp_config.json"
-
 if [ -f "${MCP_CONFIG}" ]; then
     python3 -c "
 import json
 with open('${MCP_CONFIG}', 'r') as f:
     data = json.load(f)
-servers = data.setdefault('mcpServers', {})
-servers['fast-tools'] = {
-    'command': '${BIN_DIR}/fast-tools',
-    'args': ['--mcp']
-}
-servers['fast-view'] = {
-    'command': '${BIN_DIR}/view-file',
-    'args': ['--mcp']
-}
-with open('${MCP_CONFIG}', 'w') as f:
-    json.dump(data, f, indent=2)
+servers = data.get('mcpServers', {})
+changed = False
+if 'fast-tools' in servers:
+    del servers['fast-tools']
+    changed = True
+if 'fast-view' in servers:
+    del servers['fast-view']
+    changed = True
+if changed:
+    with open('${MCP_CONFIG}', 'w') as f:
+        json.dump(data, f, indent=2)
+    print('Cleaned redundant MCP servers from ${MCP_CONFIG}')
 "
-    echo "Updated ${MCP_CONFIG}"
-else
-    python3 -c "
-import json
-data = {
-    'mcpServers': {
-        'fast-tools': {
-            'command': '${BIN_DIR}/fast-tools',
-            'args': ['--mcp']
-        },
-        'fast-view': {
-            'command': '${BIN_DIR}/view-file',
-            'args': ['--mcp']
-        }
-    }
-}
-with open('${MCP_CONFIG}', 'w') as f:
-    json.dump(data, f, indent=2)
-"
-    echo "Created ${MCP_CONFIG}"
 fi
 
-echo "Registering global hooks..."
+echo "Registering global hooks in ${GEMINI_CONFIG_DIR}/hooks.json..."
+mkdir -p "${GEMINI_CONFIG_DIR}"
 HOOKS_CONFIG="${GEMINI_CONFIG_DIR}/hooks.json"
 python3 -c '
 import json, os, shutil, time, sys
@@ -74,7 +59,7 @@ if os.path.exists(hooks_file):
     except Exception as e:
         backup = hooks_file + ".bak." + str(int(time.time()))
         shutil.copy2(hooks_file, backup)
-        sys.stderr.write(f"Error parsing existing {hooks_file}: {e}\nBacked up original to {backup}. Aborting to avoid destroying existing hooks.\n")
+        sys.stderr.write(f"Error parsing existing {hooks_file}: {e}\nBacked up original to {backup}. Aborting.\n")
         sys.exit(1)
 else:
     current = {}
@@ -83,34 +68,33 @@ current["fast-tools-optimizer"] = incoming["fast-tools-optimizer"]
 with open(hooks_file, "w") as f:
     json.dump(current, f, indent=2)
 ' "${HOOKS_CONFIG}" "${SCRIPT_DIR}/config/hooks.json"
-echo "Registered fast-tools-optimizer in ${HOOKS_CONFIG}"
+echo "Registered fast-tools-optimizer with PreToolUse, PostToolUse, and Stop hooks."
 
-echo "Registering global agent rules in ~/.gemini/GEMINI.md and ~/.gemini/AGENTS.md..."
-RULES_BLOCK='
-## Deterministic Fast Tools
+# Strip redundant prompt rules from ~/.gemini/GEMINI.md and ~/.gemini/AGENTS.md
+echo "Cleaning redundant prompt rules from GEMINI.md and AGENTS.md..."
+python3 -c '
+import re, sys
 
-- **Batch & Whole-File Reading**: Avoid reading files one-by-one across multiple turns. Call `view-file <path1> <path2> ...` (or `fast-tools view`) to ingest multiple files in a single pass up to 5,000 lines / 500 KB per file.
-- **Context Search**: Use `fast-tools grep "<pattern>" <path...> -c 10` for code search with clamped surrounding context lines instead of running raw search followed by manual line slicing.
-- **Atomic Edit and Verify**: When modifying code that has an associated test or linter, use `fast-tools edit <file> "<target>" "<replacement>" --verify "<test/lint cmd>"` to apply changes with immediate validation and automatic rollback on failure.
-- **Process & Port Polling**: Never run shell sleep loops, repeated `lsof`, or inline python scripts with `os.kill(pid, 0)` to check service state. Use `fast-tools poll --pid <pid> --state alive` or `fast-tools poll --port <port> --state ready`.
-- **Working Tree Inspection**: Use `fast-tools git-snapshot` to retrieve branch name, dirty file list, and diff stats in a single call before preparing commits.
-'
+def clean_rules(file_path):
+    try:
+        with open(file_path, "r") as f:
+            content = f.read()
+    except FileNotFoundError:
+        return
 
-for rule_file in "${GEMINI_DIR}/GEMINI.md" "${GEMINI_DIR}/AGENTS.md"; do
-    if [ -f "${rule_file}" ]; then
-        if ! grep -q "## Deterministic Fast Tools" "${rule_file}"; then
-            echo "${RULES_BLOCK}" >> "${rule_file}"
-            echo "Added deterministic tool rules to ${rule_file}"
-        else
-            echo "Rules already present in ${rule_file}"
-        fi
-    else
-        echo "# Global Rules${RULES_BLOCK}" > "${rule_file}"
-        echo "Created ${rule_file} with deterministic tool rules"
-    fi
-done
+    pattern = r"\n?## Deterministic Fast Tools\n+(?:- \*\*[^\n]+\n*)*"
+    cleaned = re.sub(pattern, "\n", content)
+    if cleaned != content:
+        with open(file_path, "w") as f:
+            f.write(cleaned)
+        print(f"Removed Deterministic Fast Tools block from {file_path}")
+
+clean_rules(sys.argv[1] + "/GEMINI.md")
+clean_rules(sys.argv[1] + "/AGENTS.md")
+' "${GEMINI_DIR}"
 
 echo "Installation complete."
-echo "Binaries installed:"
-echo "  - ${BIN_DIR}/fast-tools"
-echo "  - ${BIN_DIR}/view-file"
+echo "Active hooks in ${HOOKS_CONFIG}:"
+echo "  - PreToolUse: Rewrites git status to fast-tools git-snapshot"
+echo "  - PostToolUse: Auto-fixes em-dashes on disk for written/edited markdown"
+echo "  - Stop: Validates generated artifacts against banned words and style rules"

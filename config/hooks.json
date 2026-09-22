@@ -23,6 +23,13 @@
           }
         ]
       }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "~/.local/bin/fast-tools hook-stop",
+        "timeout": 5
+      }
     ]
   }
 }

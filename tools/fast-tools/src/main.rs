@@ -121,6 +121,18 @@ enum Commands {
 
     #[command(about = "Antigravity PostToolUse lifecycle hook handler (reads stdin, outputs JSON)")]
     HookPost,
+
+    #[command(about = "Antigravity Stop lifecycle hook handler (reads stdin, outputs JSON)")]
+    HookStop,
+
+    #[command(about = "Check files for em dashes, banned words, and style violations")]
+    StyleCheck {
+        #[arg(required = true, help = "File path(s) to check")]
+        paths: Vec<PathBuf>,
+
+        #[arg(long, help = "Automatically fix em-dashes on disk")]
+        fix: bool,
+    },
 }
 
 fn main() {
@@ -284,7 +296,63 @@ fn main() {
         }
 
         Some(Commands::HookPost) => {
-            println!("{{}}");
+            let stream = serde_json::Deserializer::from_reader(io::stdin().lock()).into_iter::<serde_json::Value>();
+            let mut result = serde_json::Value::Object(serde_json::Map::new());
+            if let Some(v) = stream.flatten().next() {
+                result = fast_tools::hooks::route_post_tool(&v.to_string());
+            }
+            println!("{}", serde_json::to_string(&result).unwrap_or_else(|_| "{}".to_string()));
+        }
+
+        Some(Commands::HookStop) => {
+            let stream = serde_json::Deserializer::from_reader(io::stdin().lock()).into_iter::<serde_json::Value>();
+            let mut resp = fast_tools::hooks::StopResponse {
+                decision: "allow".to_string(),
+                reason: None,
+            };
+            if let Some(v) = stream.flatten().next() {
+                resp = fast_tools::hooks::route_stop_hook(&v.to_string());
+            }
+            println!("{}", serde_json::to_string(&resp).unwrap_or_default());
+        }
+
+        Some(Commands::StyleCheck { paths, fix }) => {
+            let mut total_violations = 0;
+            let mut total_fixed = 0;
+            for path in paths {
+                match fast_tools::style::check_and_fix_file(&path, fix) {
+                    Ok(report) => {
+                        total_fixed += report.em_dashes_fixed;
+                        total_violations += report.violations.len();
+                        if !report.is_clean() {
+                            println!("Style violations in {}:", report.file_path);
+                            for v in report.violations {
+                                println!(
+                                    "  line {}: [{}] found '{}' in: {}",
+                                    v.line_number, v.rule, v.term, v.snippet
+                                );
+                            }
+                        } else if report.em_dashes_fixed > 0 {
+                            println!(
+                                "{}: Fixed {} em dash(es). Clean.",
+                                report.file_path, report.em_dashes_fixed
+                            );
+                        } else {
+                            println!("{}: Clean.", report.file_path);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Error reading {}: {}", path.display(), e);
+                        process::exit(1);
+                    }
+                }
+            }
+            if total_fixed > 0 {
+                println!("Total em dashes fixed: {}", total_fixed);
+            }
+            if total_violations > 0 {
+                process::exit(1);
+            }
         }
 
         None => {

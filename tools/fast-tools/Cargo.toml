@@ -9,10 +9,6 @@ description = "Deterministic high-performance developer tools, batch file reader
 name = "fast-tools"
 path = "src/main.rs"
 
-[[bin]]
-name = "view-file"
-path = "src/bin/view_file.rs"
-
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }

@@ -4,4 +4,5 @@ pub mod grep;
 pub mod hooks;
 pub mod mcp;
 pub mod poll;
+pub mod style;
 pub mod view;

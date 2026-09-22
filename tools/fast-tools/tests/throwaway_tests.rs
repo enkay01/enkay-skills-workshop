@@ -216,3 +216,27 @@ fn throwaway_test_mcp_port_overflow_handled() {
     let text = result.get("content").unwrap().as_array().unwrap()[0].get("text").unwrap().as_str().unwrap();
     assert!(text.contains("out of range for u16"));
 }
+
+#[test]
+fn throwaway_test_style_pathological_em_dashes() {
+    let raw = "———\n—\nnormal—connected—words\n";
+    let (fixed, count, _) = fast_tools::style::check_and_fix_content(raw, true);
+    assert_eq!(count, 6);
+    assert_eq!(fixed, "---\n-\nnormal-connected-words\n");
+}
+
+#[test]
+fn throwaway_test_stop_hook_missing_and_corrupt_dirs() {
+    let input = json!({
+        "terminationReason": "model_stop",
+        "artifactDirectoryPath": "/tmp/definitely_not_a_real_directory_12345678"
+    }).to_string();
+
+    let resp = fast_tools::hooks::route_stop_hook(&input);
+    assert_eq!(resp.decision, "allow");
+
+    // Malformed JSON should not panic
+    let bad_json = "not even json { [";
+    let resp_bad = fast_tools::hooks::route_stop_hook(bad_json);
+    assert_eq!(resp_bad.decision, "allow");
+}

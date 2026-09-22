@@ -465,3 +465,62 @@ fn test_hook_router_preserves_chained_and_redirected_commands() {
     }).to_string();
     assert!(route_pre_tool(&input_py_literal).overwrite.is_none());
 }
+
+#[test]
+fn test_style_em_dash_auto_fixing() {
+    let dir = tempdir().expect("Failed to create temp dir");
+    let file_path = dir.path().join("report.md");
+    fs::write(&file_path, "The release was fast — really fast — and reliable.").expect("Failed to write file");
+
+    let report = fast_tools::style::check_and_fix_file(&file_path, true).expect("check_and_fix_file failed");
+    assert_eq!(report.em_dashes_fixed, 2);
+    assert!(report.is_clean());
+
+    let updated = fs::read_to_string(&file_path).expect("Failed to read file");
+    assert_eq!(updated, "The release was fast - really fast - and reliable.");
+}
+
+#[test]
+fn test_style_banned_words_detection() {
+    let dir = tempdir().expect("Failed to create temp dir");
+    let file_path = dir.path().join("draft.md");
+    let bad_text = "This is a crucial fix.\nAdditionally, we delve into the system.\nIt is not just fast, but reliable.\n";
+    fs::write(&file_path, bad_text).expect("Failed to write file");
+
+    let report = fast_tools::style::check_and_fix_file(&file_path, false).expect("check_and_fix_file failed");
+    assert!(!report.is_clean());
+    let rules: Vec<_> = report.violations.iter().map(|v| v.rule.as_str()).collect();
+    assert!(rules.contains(&"banned-word"));
+    assert!(rules.contains(&"banned-construction"));
+}
+
+#[test]
+fn test_style_ignores_code_blocks() {
+    let content = "Normal text here.\n```rust\nlet crucial = 42;\n// not just x, but y\n```\nAll clean afterwards.\n";
+    let (_, fixed, violations) = fast_tools::style::check_and_fix_content(content, false);
+    assert_eq!(fixed, 0);
+    assert!(violations.is_empty(), "Violations inside code blocks must be ignored");
+}
+
+#[test]
+fn test_hook_stop_blocks_violations_and_allows_clean() {
+    let dir = tempdir().expect("Failed to create temp dir");
+    let bad_file = dir.path().join("artifact.md");
+    fs::write(&bad_file, "This is a pivotal finding.\n").expect("Failed to write bad file");
+
+    let stop_input = json!({
+        "executionNum": 1,
+        "terminationReason": "model_stop",
+        "artifactDirectoryPath": dir.path().to_string_lossy().to_string()
+    }).to_string();
+
+    let stop_resp = fast_tools::hooks::route_stop_hook(&stop_input);
+    assert_eq!(stop_resp.decision, "continue");
+    assert!(stop_resp.reason.unwrap().contains("pivotal"));
+
+    // Fix the file
+    fs::write(&bad_file, "This is an important finding.\n").expect("Failed to write clean file");
+    let clean_resp = fast_tools::hooks::route_stop_hook(&stop_input);
+    assert_eq!(clean_resp.decision, "allow");
+    assert!(clean_resp.reason.is_none());
+}
