@@ -303,7 +303,31 @@ fn test_view_start_past_preview_cap() {
     let result = view_single_file(&file_path, &opts).expect("view_single_file failed");
     assert!(result.contains("3000: line 3000"));
     assert!(result.contains("3050: line 3050"));
+    assert!(result.contains("3999: line 3999"));
+    assert!(!result.contains("4000: line 4000"));
     assert!(!result.contains("[Showing first 1000 lines"));
+    assert!(result.contains("[Showing lines 3000-3999 of 6000 lines (capped preview)."));
+}
+
+#[test]
+fn test_view_start_at_beginning_on_large_file_is_capped() {
+    let dir = tempdir().expect("Failed to create temp dir");
+    let file_path = dir.path().join("huge.txt");
+    let content = (1..=6000).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
+    fs::write(&file_path, content).expect("Failed to write file");
+
+    let opts = ViewOptions {
+        start_line: Some(1),
+        end_line: None,
+        line_numbers: true,
+        ..Default::default()
+    };
+
+    let result = view_single_file(&file_path, &opts).expect("view_single_file failed");
+    assert!(result.contains("   1: line 1"));
+    assert!(result.contains("1000: line 1000"));
+    assert!(!result.contains("1001: line 1001"));
+    assert!(result.contains("[Showing first 1000 lines of 6000 lines."));
 }
 
 #[test]

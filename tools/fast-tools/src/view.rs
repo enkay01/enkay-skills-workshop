@@ -114,11 +114,15 @@ pub fn view_single_file(path: &Path, opts: &ViewOptions) -> Result<String, Strin
     }
 
     // Line cap
-    let should_cap = !opts.force_all && total_lines > DEFAULT_MAX_LINES && opts.start_line.is_none() && opts.end_line.is_none();
-    let max_render_line = if should_cap { CAPPED_PREVIEW_LINES } else { total_lines };
+    let should_cap = !opts.force_all && total_lines > DEFAULT_MAX_LINES;
 
     let start = opts.start_line.unwrap_or(1).max(1);
-    let end = opts.end_line.unwrap_or(max_render_line).min(total_lines);
+    let default_end = if should_cap {
+        start.saturating_add(CAPPED_PREVIEW_LINES).saturating_sub(1)
+    } else {
+        total_lines
+    };
+    let end = opts.end_line.unwrap_or(default_end).min(total_lines);
 
     if start > total_lines && total_lines > 0 {
         return Err(format!("start_line {} exceeds total lines {}", start, total_lines));
@@ -144,10 +148,17 @@ pub fn view_single_file(path: &Path, opts: &ViewOptions) -> Result<String, Strin
     }
 
     if should_cap && opts.end_line.is_none() {
-        output.push_str(&format!(
-            "\n[Showing first {} lines of {} lines. Pass --force-all to read entire file or specify -s and -e]\n",
-            CAPPED_PREVIEW_LINES, total_lines
-        ));
+        if start == 1 {
+            output.push_str(&format!(
+                "\n[Showing first {} lines of {} lines. Pass --force-all to read entire file or specify -s and -e]\n",
+                CAPPED_PREVIEW_LINES, total_lines
+            ));
+        } else {
+            output.push_str(&format!(
+                "\n[Showing lines {}-{} of {} lines (capped preview). Pass --force-all to read entire file or specify -s and -e]\n",
+                start, end, total_lines
+            ));
+        }
     }
 
     Ok(output)
