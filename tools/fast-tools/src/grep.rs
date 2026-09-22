@@ -1,5 +1,6 @@
 use regex::RegexBuilder;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -18,21 +19,35 @@ pub fn clamp_range(match_line: usize, context: usize, total_lines: usize) -> (us
         return (1, 1);
     }
     let start = match_line.saturating_sub(context).max(1);
-    let end = (match_line + context).min(total_lines);
+    let end = match_line.saturating_add(context).min(total_lines);
     (start, end)
 }
 
-fn collect_files_recursive(dir: &Path, files: &mut Vec<PathBuf>) {
+fn collect_files_recursive(dir: &Path, files: &mut Vec<PathBuf>, visited: &mut HashSet<PathBuf>) {
+    let canonical = match dir.canonicalize() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    if !visited.insert(canonical) {
+        return;
+    }
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
-            let p = entry.path();
-            if p.is_dir() {
+            let Ok(file_type) = entry.file_type() else { continue; };
+            if file_type.is_symlink() {
+                if let Ok(target_meta) = std::fs::metadata(entry.path()) {
+                    if target_meta.is_file() {
+                        files.push(entry.path());
+                    }
+                }
+            } else if file_type.is_dir() {
+                let p = entry.path();
                 let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
                 if !name.starts_with('.') && name != "target" && name != "node_modules" {
-                    collect_files_recursive(&p, files);
+                    collect_files_recursive(&p, files, visited);
                 }
-            } else if p.is_file() {
-                files.push(p);
+            } else if file_type.is_file() {
+                files.push(entry.path());
             }
         }
     }
@@ -60,9 +75,10 @@ pub fn search_context(
     };
 
     let mut file_list = Vec::new();
+    let mut visited = HashSet::new();
     for t in targets {
         if t.is_dir() {
-            collect_files_recursive(t, &mut file_list);
+            collect_files_recursive(t, &mut file_list, &mut visited);
         } else if t.is_file() {
             file_list.push(t.clone());
         }

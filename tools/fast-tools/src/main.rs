@@ -277,11 +277,8 @@ fn main() {
                 reason: None,
                 overwrite: None,
             };
-            for val in stream {
-                if let Ok(v) = val {
-                    resp = route_pre_tool(&v.to_string());
-                    break;
-                }
+            if let Some(v) = stream.flatten().next() {
+                resp = route_pre_tool(&v.to_string());
             }
             println!("{}", serde_json::to_string(&resp).unwrap_or_default());
         }

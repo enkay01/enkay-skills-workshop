@@ -60,25 +60,29 @@ fi
 
 echo "Registering global hooks..."
 HOOKS_CONFIG="${GEMINI_CONFIG_DIR}/hooks.json"
-python3 -c "
-import json, os
-hooks_file = '${HOOKS_CONFIG}'
-with open('${SCRIPT_DIR}/config/hooks.json') as f:
+python3 -c '
+import json, os, shutil, time, sys
+hooks_file = sys.argv[1]
+incoming_file = sys.argv[2]
+with open(incoming_file) as f:
     incoming = json.load(f)
 
 if os.path.exists(hooks_file):
     try:
-        with open(hooks_file, 'r') as f:
+        with open(hooks_file, "r") as f:
             current = json.load(f)
-    except Exception:
-        current = {}
+    except Exception as e:
+        backup = hooks_file + ".bak." + str(int(time.time()))
+        shutil.copy2(hooks_file, backup)
+        sys.stderr.write(f"Error parsing existing {hooks_file}: {e}\nBacked up original to {backup}. Aborting to avoid destroying existing hooks.\n")
+        sys.exit(1)
 else:
     current = {}
 
-current['fast-tools-optimizer'] = incoming['fast-tools-optimizer']
-with open(hooks_file, 'w') as f:
+current["fast-tools-optimizer"] = incoming["fast-tools-optimizer"]
+with open(hooks_file, "w") as f:
     json.dump(current, f, indent=2)
-"
+' "${HOOKS_CONFIG}" "${SCRIPT_DIR}/config/hooks.json"
 echo "Registered fast-tools-optimizer in ${HOOKS_CONFIG}"
 
 echo "Registering global agent rules in ~/.gemini/GEMINI.md and ~/.gemini/AGENTS.md..."

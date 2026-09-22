@@ -1,6 +1,6 @@
 use fast_tools::edit::{edit_and_verify, EditParams};
 use fast_tools::git::get_working_tree_snapshot;
-use fast_tools::grep::search_context;
+use fast_tools::grep::{clamp_range, search_context};
 use fast_tools::hooks::route_pre_tool;
 use fast_tools::poll::{poll_service, PollConfig, TargetState};
 use fast_tools::view::{view_batch_files, view_single_file, ViewOptions};
@@ -284,4 +284,160 @@ fn test_hook_router_intercepts_os_kill_python() {
     assert!(response.overwrite.is_some());
     let new_cmd = response.overwrite.unwrap().get("CommandLine").and_then(|v| v.as_str()).unwrap().to_string();
     assert_eq!(new_cmd, "fast-tools poll --pid 7788 --state alive --timeout 5000");
+}
+
+#[test]
+fn test_view_start_past_preview_cap() {
+    let dir = tempdir().expect("Failed to create temp dir");
+    let file_path = dir.path().join("long.txt");
+    let content = (1..=6000).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
+    fs::write(&file_path, content).expect("Failed to write file");
+
+    let opts = ViewOptions {
+        start_line: Some(3000),
+        end_line: None,
+        line_numbers: true,
+        ..Default::default()
+    };
+
+    let result = view_single_file(&file_path, &opts).expect("view_single_file failed");
+    assert!(result.contains("3000: line 3000"));
+    assert!(result.contains("3050: line 3050"));
+    assert!(!result.contains("[Showing first 1000 lines"));
+}
+
+#[test]
+fn test_view_batch_enforces_byte_budget() {
+    let dir = tempdir().expect("Failed to create temp dir");
+    let file_a = dir.path().join("a.rs");
+    let file_b = dir.path().join("b.rs");
+    let code_a = "pub fn function_a() {\n    println!(\"hello\");\n}\n".repeat(20);
+    let code_b = "pub fn function_b() {\n    println!(\"world\");\n}\n".repeat(20);
+    fs::write(&file_a, code_a).expect("Failed to write a");
+    fs::write(&file_b, code_b).expect("Failed to write b");
+
+    // Very small budget: 200 bytes
+    let opts = ViewOptions::default();
+    let batch_output = view_batch_files(&[file_a, file_b], &opts, 200);
+    assert!(batch_output.contains("[Aggregate budget reached; displaying outline]"));
+}
+
+#[test]
+fn test_grep_clamp_range_overflow_safety() {
+    // Huge context value must not overflow match_line + context
+    let (start, end) = clamp_range(5, usize::MAX, 10);
+    assert_eq!(start, 1);
+    assert_eq!(end, 10);
+}
+
+#[test]
+fn test_grep_symlink_recursion_safety() {
+    let dir = tempdir().expect("Failed to create temp dir");
+    let sub = dir.path().join("subdir");
+    fs::create_dir(&sub).expect("Failed to create subdir");
+    let sample = sub.join("sample.txt");
+    fs::write(&sample, "target string inside file").expect("Failed to write sample");
+
+    // Create a symlink loop: subdir/loop -> dir
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+        let loop_link = sub.join("loop");
+        let _ = symlink(dir.path(), &loop_link);
+    }
+
+    let matches = search_context(
+        &[dir.path().to_path_buf()],
+        "target string",
+        2,
+        5,
+        false,
+        false,
+    ).expect("search_context must succeed without infinite recursion");
+
+    assert_eq!(matches.len(), 1);
+}
+
+#[test]
+fn test_poll_service_rejects_empty_config() {
+    let config = PollConfig {
+        pid: None,
+        port: None,
+        state: TargetState::Ready,
+        timeout_ms: 100,
+        interval_ms: 10,
+    };
+
+    let report = poll_service(&config);
+    assert!(!report.success);
+    assert!(report.message.contains("Neither pid nor port"));
+}
+
+#[test]
+fn test_edit_and_verify_no_command_reports_unverified() {
+    let dir = tempdir().expect("Failed to create temp dir");
+    let file_path = dir.path().join("plain.txt");
+    fs::write(&file_path, "before edit").expect("Failed to write file");
+
+    let params = EditParams {
+        target_file: file_path.to_string_lossy().to_string(),
+        target_content: "before".to_string(),
+        replacement_content: "after".to_string(),
+        allow_multiple: false,
+        verify_command: None,
+        rollback_on_failure: false,
+        cwd: None,
+    };
+
+    let report = edit_and_verify(&params);
+    assert!(report.success);
+    assert!(!report.verified); // verified must be false when no verify_command executed
+}
+
+#[test]
+fn test_hook_router_preserves_chained_and_redirected_commands() {
+    // cat with redirection
+    let input_redirect = json!({
+        "toolCall": {
+            "name": "run_command",
+            "args": { "CommandLine": "cat < README.md" }
+        }
+    }).to_string();
+    assert!(route_pre_tool(&input_redirect).overwrite.is_none());
+
+    // cat with here-doc
+    let input_heredoc = json!({
+        "toolCall": {
+            "name": "run_command",
+            "args": { "CommandLine": "cat <<EOF\nhello\nEOF" }
+        }
+    }).to_string();
+    assert!(route_pre_tool(&input_heredoc).overwrite.is_none());
+
+    // lsof in pipeline
+    let input_lsof_pipe = json!({
+        "toolCall": {
+            "name": "run_command",
+            "args": { "CommandLine": "lsof -p 1234 | grep LISTEN" }
+        }
+    }).to_string();
+    assert!(route_pre_tool(&input_lsof_pipe).overwrite.is_none());
+
+    // python os.kill chained with &&
+    let input_py_chained = json!({
+        "toolCall": {
+            "name": "run_command",
+            "args": { "CommandLine": "python3 -c \"import os; os.kill(1234, 0); print(1)\" && echo done" }
+        }
+    }).to_string();
+    assert!(route_pre_tool(&input_py_chained).overwrite.is_none());
+
+    // python with literal print mentioning os.kill
+    let input_py_literal = json!({
+        "toolCall": {
+            "name": "run_command",
+            "args": { "CommandLine": "python3 -c \"print('os.kill(1234, 0)')\"" }
+        }
+    }).to_string();
+    assert!(route_pre_tool(&input_py_literal).overwrite.is_none());
 }

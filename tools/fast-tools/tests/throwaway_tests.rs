@@ -1,8 +1,10 @@
 use fast_tools::edit::{edit_and_verify, EditParams};
 use fast_tools::grep::search_context;
 use fast_tools::hooks::route_pre_tool;
+use fast_tools::mcp::handle_mcp_request;
 use fast_tools::poll::{poll_service, PollConfig, TargetState};
 use fast_tools::view::{view_single_file, ViewOptions};
+use serde_json::json;
 use std::fs;
 use tempfile::tempdir;
 
@@ -152,4 +154,65 @@ fn throwaway_test_large_file_line_capping() {
 
     let capped = view_single_file(&p, &ViewOptions::default()).unwrap();
     assert!(capped.contains("[Showing first 1000 lines of 6000 lines."));
+}
+
+#[test]
+fn throwaway_test_mcp_unknown_tool_returns_error() {
+    let req = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "unknown_magic_tool",
+            "arguments": {}
+        }
+    });
+
+    let resp = handle_mcp_request(&req).expect("Expected response");
+    assert!(resp.get("error").is_some());
+    let err = resp.get("error").unwrap();
+    assert_eq!(err.get("code").and_then(|c| c.as_i64()), Some(-32602));
+    assert!(err.get("message").and_then(|m| m.as_str()).unwrap().contains("Unknown tool"));
+}
+
+#[test]
+fn throwaway_test_mcp_tool_failure_sets_is_error() {
+    let req = json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {
+            "name": "edit_and_verify",
+            "arguments": {
+                "target_file": "/nonexistent/path/for/sure.txt",
+                "target_content": "foo",
+                "replacement_content": "bar"
+            }
+        }
+    });
+
+    let resp = handle_mcp_request(&req).expect("Expected response");
+    let result = resp.get("result").expect("Expected result object");
+    assert_eq!(result.get("isError").and_then(|v| v.as_bool()), Some(true));
+}
+
+#[test]
+fn throwaway_test_mcp_port_overflow_handled() {
+    let req = json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "tools/call",
+        "params": {
+            "name": "poll_service",
+            "arguments": {
+                "port": 70000
+            }
+        }
+    });
+
+    let resp = handle_mcp_request(&req).expect("Expected response");
+    let result = resp.get("result").expect("Expected result object");
+    assert_eq!(result.get("isError").and_then(|v| v.as_bool()), Some(true));
+    let text = result.get("content").unwrap().as_array().unwrap()[0].get("text").unwrap().as_str().unwrap();
+    assert!(text.contains("out of range for u16"));
 }

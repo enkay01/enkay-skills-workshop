@@ -96,7 +96,7 @@ pub fn edit_and_verify(params: &EditParams) -> EditReport {
     let Some(ref cmd_str) = params.verify_command else {
         return EditReport {
             success: true,
-            verified: true,
+            verified: false,
             rolled_back: false,
             replacements_made: replacements_count,
             verify_output: String::new(),
@@ -138,7 +138,7 @@ pub fn edit_and_verify(params: &EditParams) -> EditReport {
             rolled_back: false,
             replacements_made: replacements_count,
             verify_output: combined_output,
-            message: format!("Edit applied and verified successfully (exit 0)."),
+            message: "Edit applied and verified successfully (exit 0).".to_string(),
         }
     } else {
         if params.rollback_on_failure {

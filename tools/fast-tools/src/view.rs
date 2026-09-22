@@ -83,6 +83,10 @@ pub fn view_single_file(path: &Path, opts: &ViewOptions) -> Result<String, Strin
     let all_lines: Vec<String> = reader.lines().collect::<Result<_, _>>().map_err(|e| e.to_string())?;
     let total_lines = all_lines.len();
 
+    if total_lines == 0 {
+        return Ok(String::new());
+    }
+
     if opts.outline {
         let outline = extract_outline(&all_lines);
         if outline.is_empty() {
@@ -110,7 +114,7 @@ pub fn view_single_file(path: &Path, opts: &ViewOptions) -> Result<String, Strin
     }
 
     // Line cap
-    let should_cap = !opts.force_all && total_lines > DEFAULT_MAX_LINES;
+    let should_cap = !opts.force_all && total_lines > DEFAULT_MAX_LINES && opts.start_line.is_none() && opts.end_line.is_none();
     let max_render_line = if should_cap { CAPPED_PREVIEW_LINES } else { total_lines };
 
     let start = opts.start_line.unwrap_or(1).max(1);
@@ -118,6 +122,9 @@ pub fn view_single_file(path: &Path, opts: &ViewOptions) -> Result<String, Strin
 
     if start > total_lines && total_lines > 0 {
         return Err(format!("start_line {} exceeds total lines {}", start, total_lines));
+    }
+    if start > end {
+        return Err(format!("start_line {} is greater than end_line {}", start, end));
     }
 
     let mut output = String::new();
@@ -153,12 +160,13 @@ pub fn view_batch_files(paths: &[PathBuf], opts: &ViewOptions, max_aggregate_byt
     for (idx, p) in paths.iter().enumerate() {
         out.push_str(&format!("=== File [{}/{}]: {} ===\n", idx + 1, paths.len(), p.display()));
 
-        if total_bytes > max_aggregate_bytes {
+        if total_bytes >= max_aggregate_bytes {
             // Degrade to outline to protect context window
             let mut outline_opts = opts.clone();
             outline_opts.outline = true;
             match view_single_file(p, &outline_opts) {
                 Ok(content) => {
+                    total_bytes += content.len();
                     out.push_str(&format!("[Aggregate budget reached; displaying outline]\n{}\n\n", content));
                 }
                 Err(err) => {
@@ -170,9 +178,24 @@ pub fn view_batch_files(paths: &[PathBuf], opts: &ViewOptions, max_aggregate_byt
 
         match view_single_file(p, opts) {
             Ok(content) => {
-                total_bytes += content.len();
-                out.push_str(&content);
-                out.push_str("\n\n");
+                if total_bytes + content.len() > max_aggregate_bytes && !opts.outline {
+                    // Content exceeds aggregate budget; degrade to outline
+                    let mut outline_opts = opts.clone();
+                    outline_opts.outline = true;
+                    match view_single_file(p, &outline_opts) {
+                        Ok(outline_content) => {
+                            total_bytes += outline_content.len();
+                            out.push_str(&format!("[Aggregate budget reached; displaying outline]\n{}\n\n", outline_content));
+                        }
+                        Err(err) => {
+                            out.push_str(&format!("Error reading {}: {}\n\n", p.display(), err));
+                        }
+                    }
+                } else {
+                    total_bytes += content.len();
+                    out.push_str(&content);
+                    out.push_str("\n\n");
+                }
             }
             Err(err) => {
                 out.push_str(&format!("Error reading {}: {}\n\n", p.display(), err));

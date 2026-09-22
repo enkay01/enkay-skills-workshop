@@ -27,7 +27,26 @@ pub struct PollReport {
 }
 
 pub fn check_pid_alive(pid: i32) -> bool {
-    unsafe { libc::kill(pid, 0) == 0 }
+    let ret = unsafe { libc::kill(pid, 0) };
+    if ret == 0 {
+        #[cfg(target_os = "linux")]
+        {
+            if let Ok(stat) = std::fs::read_to_string(format!("/proc/{}/stat", pid)) {
+                if let Some(idx) = stat.rfind(')') {
+                    let rest = stat[idx + 1..].trim_start();
+                    if let Some(state_char) = rest.chars().next() {
+                        if state_char == 'Z' || state_char == 'X' {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+        true
+    } else {
+        let err = std::io::Error::last_os_error();
+        matches!(err.raw_os_error(), Some(libc::EPERM))
+    }
 }
 
 pub fn check_port_open(port: u16, timeout: Duration) -> bool {
@@ -39,6 +58,14 @@ pub fn check_port_open(port: u16, timeout: Duration) -> bool {
 }
 
 pub fn poll_service(config: &PollConfig) -> PollReport {
+    if config.pid.is_none() && config.port.is_none() {
+        return PollReport {
+            success: false,
+            elapsed_ms: 0,
+            message: "Neither pid nor port was specified for polling.".to_string(),
+        };
+    }
+
     let start = Instant::now();
     let timeout = Duration::from_millis(config.timeout_ms);
     let interval = Duration::from_millis(config.interval_ms.max(10));
