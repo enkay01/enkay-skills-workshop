@@ -1,0 +1,433 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PyAutoGUI Laptop Controller Architecture</title>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+  <script>
+    mermaid.initialize({
+      startOnLoad: true,
+      theme: 'dark',
+      themeVariables: {
+        darkMode: true,
+        background: '#161b22',
+        primaryColor: '#238636',
+        primaryTextColor: '#f0f6fc',
+        primaryBorderColor: '#30363d',
+        lineColor: '#58a6ff',
+        secondaryColor: '#1f6feb',
+        tertiaryColor: '#21262d'
+      }
+    });
+  </script>
+  <style>
+    :root {
+      --bg: #0d1117;
+      --card-bg: #161b22;
+      --border: #30363d;
+      --text: #c9d1d9;
+      --heading: #f0f6fc;
+      --accent: #58a6ff;
+      --green: #238636;
+      --code-bg: #0a0c10;
+      --code-text: #79c0ff;
+    }
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+      line-height: 1.6;
+      padding: 32px 20px;
+    }
+    .container {
+      max-width: 960px;
+      margin: 0 auto;
+    }
+    header {
+      margin-bottom: 40px;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 20px;
+    }
+    h1 {
+      color: var(--heading);
+      font-size: 28px;
+      font-weight: 600;
+      letter-spacing: -0.5px;
+      margin-bottom: 8px;
+    }
+    h2 {
+      color: var(--heading);
+      font-size: 20px;
+      font-weight: 600;
+      margin-top: 36px;
+      margin-bottom: 16px;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 6px;
+    }
+    h3 {
+      color: var(--accent);
+      font-size: 16px;
+      font-weight: 600;
+      margin-top: 20px;
+      margin-bottom: 10px;
+    }
+    p {
+      margin-bottom: 14px;
+      font-size: 15px;
+    }
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 20px;
+      margin-bottom: 24px;
+    }
+    .mermaid {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 16px;
+      margin: 16px 0;
+      display: flex;
+      justify-content: center;
+    }
+    pre {
+      background: var(--code-bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 14px;
+      overflow-x: auto;
+      font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+      font-size: 13px;
+      color: var(--code-text);
+      margin-bottom: 16px;
+      line-height: 1.45;
+    }
+    code {
+      font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+      background: rgba(110, 118, 129, 0.4);
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-size: 13px;
+      color: #79c0ff;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 16px 0;
+      font-size: 14px;
+    }
+    th, td {
+      border: 1px solid var(--border);
+      padding: 8px 12px;
+      text-align: left;
+    }
+    th {
+      background: #21262d;
+      color: var(--heading);
+      font-weight: 600;
+    }
+    td {
+      background: var(--card-bg);
+    }
+  </style>
+</head>
+<body>
+<div class="container">
+
+  <header>
+    <h1>PyAutoGUI laptop automation architecture</h1>
+    <p>Ubiquitous language, runtime behavior, and implementation model for the laptop control CLI.</p>
+  </header>
+
+  <section>
+    <h2>Ubiquitous language</h2>
+    <p>This table defines the domain terms used across the tool, automation plans, and agent interactions.</p>
+    <table>
+      <thead>
+        <tr>
+          <th>Term</th>
+          <th>Definition</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Logical point</td>
+          <td>Application coordinate unit used by macOS WindowServer and PyAutoGUI (for example, 1440x900).</td>
+        </tr>
+        <tr>
+          <td>Physical pixel</td>
+          <td>Raw hardware display framebuffer raster pixel used in screenshots (for example, 2880x1800).</td>
+        </tr>
+        <tr>
+          <td>Retina scale factor</td>
+          <td>Ratio of physical pixels to logical points (2.0 on standard MacBook displays).</td>
+        </tr>
+        <tr>
+          <td>Atomic action</td>
+          <td>Single input primitive sent to the operating system (click, move, type, press, scroll).</td>
+        </tr>
+        <tr>
+          <td>Batch plan</td>
+          <td>Ordered sequence of actions encoded in JSON with delays and target coordinates.</td>
+        </tr>
+        <tr>
+          <td>Template patch</td>
+          <td>Small cropped image representing a UI element used for 2D cross-correlation matching.</td>
+        </tr>
+        <tr>
+          <td>Target bounding box</td>
+          <td>Rectangular screen bounds defined by minimum and maximum x and y coordinates.</td>
+        </tr>
+        <tr>
+          <td>Failsafe trigger</td>
+          <td>Emergency abort mechanism invoked by slamming the mouse cursor into coordinate (0, 0).</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>System behaviour</h2>
+
+    <h3>1. Input control mechanism</h3>
+    <p>
+      PyAutoGUI generates input events through macOS CoreGraphics and Quartz event taps. When Antigravity has Accessibility permission, the process obtains an authorized Mach port connection to the WindowServer daemon.
+    </p>
+
+    <div class="mermaid">
+flowchart LR
+    CLI[laptop-control CLI] --> PyAutoGUI[PyAutoGUI Layer]
+    PyAutoGUI --> PyObjC[PyObjC Quartz Framework]
+    PyObjC --> CG[CGEventCreate / CGEventPost]
+    CG --> WS[macOS WindowServer]
+    WS --> Target[Active Window / Steam]
+    </div>
+
+    <pre><code>// macOS C-level Quartz call executed under PyObjC
+CGEventRef moveEvent = CGEventCreateMouseEvent(
+    NULL, kCGEventMouseMoved, CGPointMake(x, y), kCGMouseButtonLeft
+);
+CGEventPost(kCGHIDEventTap, moveEvent);
+CFRelease(moveEvent);</code></pre>
+
+    <h3>2. Establishing UI element coordinates</h3>
+    <p>
+      The screen presents two coordinate spaces. Screenshots from screencapture or CoreGraphics are 2880x1800 pixels. PyAutoGUI accepts logical coordinates in 1440x900 points. The tool queries display scaling and maps every coordinate automatically.
+    </p>
+
+    <div class="mermaid">
+flowchart TD
+    Raw[Physical Framebuffer: 2880x1800] --> Scaler[Retina Scale Factor: 2.0x]
+    Scaler --> Logical[Logical Screen: 1440x900]
+    Template[Template Matching: cv2.matchTemplate] --> Bounding[Physical Bounding Box: 769, 900 to 1096, 968]
+    Bounding --> Convert[Scale Translation: divide by 2.0]
+    Convert --> TargetPt[Target Click Coordinate: x=466, y=467]
+    </div>
+
+    <pre><code>def to_logical_coords(x: float, y: float, is_physical: bool, scale: float) -> tuple[float, float]:
+    if is_physical and scale > 0:
+        return x / scale, y / scale
+    return x, y</code></pre>
+
+    <h3>3. Presenting screen information to agents</h3>
+    <p>
+      Screen state is communicated to the agent via three distinct representations:
+    </p>
+    <ul>
+      <li>Visual image buffer: Screen grabs stored as PNG files and inspected directly by the agent model.</li>
+      <li>Window geometry metadata: Quartz window lists queried via CoreGraphics containing application names and bounding boxes.</li>
+      <li>Structured CLI JSON output: Machine-readable JSON strings returned on standard output containing match confidences and coordinates.</li>
+    </ul>
+
+    <pre><code>{
+  "found": true,
+  "confidence": 0.9984,
+  "threshold": 0.8,
+  "box": { "x": 384.5, "y": 450.0, "width": 164.0, "height": 34.0 },
+  "center": { "x": 466.5, "y": 467.0 },
+  "scale_factor": 2.0
+}</code></pre>
+
+    <h3>4. Behavior when targets are not found</h3>
+    <p>
+      When a target element cannot be matched above the requested confidence threshold (default 0.80), the tool exits with code 1 and outputs the highest observed correlation score without moving the mouse. In batch mode with <code>--stop-on-error</code>, execution halts immediately to prevent misclicks on unintended controls.
+    </p>
+
+    <div class="mermaid">
+flowchart TD
+    Scan[Run cv2.matchTemplate across scales] --> Check{Confidence &gt;= Threshold?}
+    Check -- Yes --> Action[Return Coordinates and Execute Click]
+    Check -- No --> Fail[Output Failure JSON and Exit Code 1]
+    Fail --> Stop[Halt Batch Pipeline]
+    </div>
+
+    <h3>5. Command corpus and discovery</h3>
+    <p>
+      The command suite is housed in <code>tools/pyautogui-cli/laptop_control.py</code> with a companion executable wrapper in <code>bin/laptop-control</code>. Agents discover supported commands using self-documenting introspection:
+    </p>
+    <ul>
+      <li>Standard help: <code>laptop-control --help</code> lists all subcommands and parameters.</li>
+      <li>Subcommand help: <code>laptop-control &lt;command&gt; --help</code> describes options for a specific command.</li>
+      <li>Self-test diagnostics: <code>laptop-control self-test</code> verifies coordinate scaling, key mappings, and OpenCV operations.</li>
+      <li>Test suite: <code>python3 -m unittest tools/pyautogui-cli/tests/test_laptop_control.py</code> runs end-to-end command tests.</li>
+    </ul>
+
+    <h3>6. Deriving intent into action</h3>
+    <p>
+      When given a high-level goal, such as opening an application and navigating to a setting, the agent follows a seven-stage decomposition sequence.
+    </p>
+
+    <div class="mermaid">
+sequenceDiagram
+    participant User
+    participant Agent
+    participant Tool as laptop-control CLI
+    participant OS as macOS / App
+
+    User->>Agent: "Open GitHub app and open Settings"
+    Agent->>Tool: open-app "GitHub Desktop"
+    Tool->>OS: open -a / AppleScript activate
+    Agent->>Tool: screenshot --output /tmp/state.png
+    Tool-->>Agent: Raw Framebuffer
+    Agent->>Agent: Inspect state, resolve menu coordinate or hotkey
+    Agent->>Tool: hotkey command comma
+    Tool->>OS: CGEventPost(Cmd + ,)
+    Agent->>Tool: screenshot --output /tmp/verify.png
+    Tool-->>Agent: Verification Image
+    Agent->>User: Done
+    </div>
+  </section>
+
+  <section>
+    <h2>Implementation details</h2>
+
+    <h3>Domain model</h3>
+    <p>
+      The domain model separates screen coordinates, device inputs, visual recognition, and plan sequences into clear abstractions.
+    </p>
+
+    <div class="mermaid">
+classDiagram
+    class DisplayMetrics {
+        +Size logical
+        +Size physical
+        +float scaleFactor
+    }
+    class TargetCoordinate {
+        +float x
+        +float y
+        +bool isPhysical
+        +toLogical(scaleFactor)
+    }
+    class TemplateMatcher {
+        +string templatePath
+        +float confidence
+        +locate(screenBuffer) MatchResult
+    }
+    class BatchPlan {
+        +List~Step~ steps
+        +float defaultDelay
+        +execute() BatchResult
+    }
+    class ActionStep {
+        +string actionType
+        +dict params
+        +float pause
+    }
+    BatchPlan "1" *-- "many" ActionStep
+    TargetCoordinate --> DisplayMetrics
+    TemplateMatcher --> DisplayMetrics
+    </div>
+
+    <h3>Data model</h3>
+    <p>
+      Batch plans use a flat JSON schema. Each step specifies an action, target properties, and optional delays.
+    </p>
+
+    <pre><code>[
+  { "action": "open-app", "app": "Steam", "wait": 0.8 },
+  { "action": "click", "x": 282, "y": 82, "pause": 0.5 },
+  { "action": "click", "x": 210, "y": 212, "pause": 0.3 },
+  { "action": "hotkey", "keys": ["command", "a"], "pause": 0.1 },
+  { "action": "type", "text": "football manager 26", "interval": 0.04 },
+  { "action": "press", "key": "enter", "pause": 0.8 },
+  { "action": "click", "x": 227, "y": 276, "pause": 1.2 },
+  { "action": "click", "x": 466, "y": 467, "pause": 2.0 },
+  { "action": "screenshot", "output": "/tmp/result.png" }
+]</code></pre>
+
+    <h3>Error handling</h3>
+    <p>
+      Errors are caught at four distinct boundaries:
+    </p>
+    <ul>
+      <li>Display query failures: If CoreGraphics mode cannot be read, the tool falls back to AppKit NSScreen, then to PyAutoGUI screen size.</li>
+      <li>Failsafe exception: Dragging the cursor to any screen corner immediately raises an uncatchable abort signal, preventing endless click loops.</li>
+      <li>CLI argument validation: Missing templates, unknown keys, and malformed JSON fail fast before any hardware events are posted.</li>
+      <li>POSIX return codes: Success exits with 0. Missing targets or invalid commands exit with 1. System exceptions exit with non-zero codes.</li>
+    </ul>
+
+    <h3>Seams and adaptors</h3>
+    <div class="mermaid">
+flowchart LR
+    subgraph Core Logic
+        CLI[laptop_control.py]
+    end
+    subgraph Adaptors
+        A1[AppleScript / open binary]
+        A2[PyAutoGUI / Quartz CGEvent]
+        A3[OpenCV matchTemplate]
+        A4[Pillow Image IO]
+    end
+    subgraph System Seams
+        S1[App Launch Seam]
+        S2[HID Input Seam]
+        S3[Vision Seam]
+        S4[Storage Seam]
+    end
+    CLI --> A1 --> S1
+    CLI --> A2 --> S2
+    CLI --> A3 --> S3
+    CLI --> A4 --> S4
+    </div>
+
+    <h3>Bottlenecks</h3>
+    <p>
+      The primary latency sources are:
+    </p>
+    <ul>
+      <li>Subshell startup: Running via <code>uv run</code> incurs 100-300ms python startup latency per command invocation. Batch mode mitigates this by running the entire sequence inside a single process invocation.</li>
+      <li>Screen capture roundtrips: Taking full 2880x1800 screenshot dumps to disk takes 120-200ms per capture.</li>
+      <li>Convolution cost: Multi-scale template matching on 5-megapixel images takes 150-300ms per template.</li>
+      <li>Application rendering: Steam and games require 500-1500ms to repaint UI views after receiving clicks.</li>
+    </ul>
+
+    <h3>Tradeoffs made</h3>
+    <p>
+      The architecture adopted three explicit technical tradeoffs:
+    </p>
+    <ul>
+      <li>PEP 723 inline script versus installed package: Selected standalone script execution with inline dependency metadata so no virtualenv activation or installation step is required.</li>
+      <li>Visual coordinate matching versus Accessibility DOM trees: Selected visual coordinates and templates because custom-rendered interfaces (Steam WebViews, games, Electron canvases) often omit macOS accessibility attributes.</li>
+      <li>Stateless batch CLI versus resident daemon: Selected simple batch execution scripts over an active background daemon, prioritizing simplicity and zero idle resource usage.</li>
+    </ul>
+
+    <h3>Limitations</h3>
+    <ul>
+      <li>Display sleep: macOS disables Quartz event taps when the screen locks or display sleeps.</li>
+      <li>Window movement: Absolute coordinates fail if target windows are dragged to a different position without re-anchoring.</li>
+      <li>Multi-display offsets: Coordinates currently assume the primary display space at origin (0, 0).</li>
+      <li>Hardware overlays: Certain full-screen 3D games render directly via Metal bypassing WindowServer compositing.</li>
+    </ul>
+  </section>
+
+</div>
+</body>
+</html>

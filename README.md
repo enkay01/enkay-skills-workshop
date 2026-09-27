@@ -60,7 +60,7 @@ Intercepts calls to `git status`, `git status -s`, or `git status --short` and r
 
 ### `PostToolUse`: Em dash auto-fixer
 
-Runs after `write_to_file` and `replace_file_content` on markdown files. Automatically replaces em dashes (`—`) with hyphens (`-`) directly on disk in zero agent turns.
+Runs after `write_to_file` and `replace_file_content` on markdown files. Automatically replaces em dashes (`-`) with hyphens (`-`) directly on disk in zero agent turns.
 
 ### `Stop`: Style guard
 
