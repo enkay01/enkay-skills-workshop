@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Resolve directory of this script
+SOURCE="${BASH_SOURCE[0]}"
+while [ -h "$SOURCE" ]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+PYTHON_SCRIPT="$SCRIPT_DIR/mac_control.py"
+
+# Locate uv executable
+UV_BIN=""
+if [ -x "/Users/iannkwocha/.local/bin/uv" ]; then
+  UV_BIN="/Users/iannkwocha/.local/bin/uv"
+elif [ -x "$HOME/.local/bin/uv" ]; then
+  UV_BIN="$HOME/.local/bin/uv"
+elif command -v uv >/dev/null 2>&1; then
+  UV_BIN="$(command -v uv)"
+else
+  echo "Error: uv is required to execute mac-control. Install uv or ensure it is in PATH." >&2
+  exit 1
+fi
+
+exec "$UV_BIN" run "$PYTHON_SCRIPT" "$@"
