@@ -15,9 +15,9 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::WindowsAndMessaging::{
-    BringWindowToTop, EnumWindows, GetClassNameW, GetForegroundWindow, GetWindowRect,
-    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsWindow, IsWindowVisible,
-    SetForegroundWindow, ShowWindow, SW_RESTORE,
+    BringWindowToTop, EnumWindows, GetAncestor, GetClassNameW, GetForegroundWindow,
+    GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
+    IsWindow, IsWindowVisible, SetForegroundWindow, ShowWindow, GA_ROOT, SW_RESTORE,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -339,21 +339,155 @@ pub fn get_window_extended_frame_bounds(hwnd: HWND) -> Result<RectBounds, String
     }
 }
 
-pub fn focus_window(hwnd_val: usize) -> Result<(), String> {
+/// A reference to a window, used to report which window actually holds the
+/// foreground when a focus request is refused.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WindowRef {
+    pub hwnd: String,
+    pub pid: u32,
+    pub title: String,
+    pub class_name: String,
+}
+
+/// A small, stable description of a window for error reporting.
+pub fn describe_window(hwnd_val: usize) -> Option<WindowRef> {
     let hwnd = HWND(hwnd_val as *mut _);
-    unsafe {
-        if !IsWindow(hwnd).as_bool() {
-            return Err("Window handle does not exist".into());
+    if hwnd.0.is_null() || !unsafe { IsWindow(hwnd) }.as_bool() {
+        return None;
+    }
+    let (title, pid) = {
+        let mut pid = 0u32;
+        unsafe {
+            GetWindowThreadProcessId(hwnd, Some(&mut pid));
+            let title_len = GetWindowTextLengthW(hwnd);
+            let mut buf = vec![0u16; (title_len + 1) as usize];
+            if title_len > 0 {
+                GetWindowTextW(hwnd, &mut buf);
+            }
+            (String::from_utf16_lossy(&buf[..title_len as usize]), pid)
         }
-        let _ = ShowWindow(hwnd, SW_RESTORE);
-        let _ = BringWindowToTop(hwnd);
-        let ok = SetForegroundWindow(hwnd);
-        if ok.as_bool() || GetForegroundWindow() == hwnd {
-            Ok(())
-        } else {
-            Err("Failed to set target window as foreground".into())
+    };
+    let class_name = unsafe {
+        let mut buf = [0u16; 256];
+        let len = GetClassNameW(hwnd, &mut buf);
+        String::from_utf16_lossy(&buf[..len as usize])
+    };
+    Some(WindowRef {
+        hwnd: hwnd_val.to_string(),
+        pid,
+        title,
+        class_name,
+    })
+}
+
+/// The window that currently holds the foreground, and its root ancestor.
+pub fn current_foreground() -> (usize, usize) {
+    unsafe {
+        let fg = GetForegroundWindow();
+        let root = GetAncestor(fg, GA_ROOT);
+        (fg.0 as usize, root.0 as usize)
+    }
+}
+
+/// Restore a window if it is minimized, bring it to the top, request the
+/// foreground, and then verify the result against the actual foreground window
+/// rather than trusting the request.
+///
+/// This uses only ordinary, documented window-management calls. It does not use
+/// simulated modifier keystrokes or any other focus-stealing workaround, so a
+/// window that refuses foreground produces an honest refusal.
+pub fn focus_window_verified(
+    hwnd_val: usize,
+    expected_pid: Option<u32>,
+    expected_create_time: Option<&str>,
+) -> Result<FocusOutcome, FocusProbe> {
+    let hwnd = HWND(hwnd_val as *mut _);
+
+    if !unsafe { IsWindow(hwnd) }.as_bool() {
+        return Err(FocusProbe {
+            code: "window_gone".into(),
+            message: "Window handle does not exist".into(),
+            actual_foreground: None,
+        });
+    }
+
+    if let Some(pid) = expected_pid {
+        let mut actual_pid = 0u32;
+        unsafe {
+            GetWindowThreadProcessId(hwnd, Some(&mut actual_pid));
+        }
+        if actual_pid != pid {
+            return Err(FocusProbe {
+                code: "window_gone".into(),
+                message: format!("PID mismatch: expected {}, got {}", pid, actual_pid),
+                actual_foreground: None,
+            });
+        }
+        if let Some(ct) = expected_create_time {
+            if ct != "unknown" {
+                let actual = get_process_creation_time(actual_pid);
+                if actual != ct {
+                    return Err(FocusProbe {
+                        code: "window_gone".into(),
+                        message: "Process creation time mismatch: process recycled".into(),
+                        actual_foreground: None,
+                    });
+                }
+            }
         }
     }
+
+    let (previous_foreground, _) = current_foreground();
+
+    // Restore first, so that switching does not fail on a minimized target.
+    let was_minimized = unsafe { IsIconic(hwnd) }.as_bool();
+    if was_minimized {
+        let _ = unsafe { ShowWindow(hwnd, SW_RESTORE) };
+    }
+    let _ = unsafe { BringWindowToTop(hwnd) };
+    let _ = unsafe { SetForegroundWindow(hwnd) };
+    // Give the window manager a moment to settle before verifying.
+    std::thread::sleep(std::time::Duration::from_millis(120));
+
+    let (fg, fg_root) = current_foreground();
+    if fg != hwnd_val && fg_root != hwnd_val {
+        return Err(FocusProbe {
+            code: "focus_refused".into(),
+            message: format!(
+                "Window {} refused foreground; {:?} holds it",
+                hwnd_val, fg
+            ),
+            actual_foreground: describe_window(fg),
+        });
+    }
+
+    Ok(FocusOutcome {
+        hwnd: hwnd_val.to_string(),
+        requested: describe_window(hwnd_val),
+        previous_foreground: describe_window(previous_foreground),
+        foreground: describe_window(fg),
+        restored_from_minimized: was_minimized,
+        verified: true,
+    })
+}
+
+/// A refused focus, carrying the window that actually holds the foreground.
+#[derive(Debug, Clone)]
+pub struct FocusProbe {
+    pub code: String,
+    pub message: String,
+    pub actual_foreground: Option<WindowRef>,
+}
+
+/// The verified result of a focus request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FocusOutcome {
+    pub hwnd: String,
+    pub requested: Option<WindowRef>,
+    pub previous_foreground: Option<WindowRef>,
+    pub foreground: Option<WindowRef>,
+    pub restored_from_minimized: bool,
+    pub verified: bool,
 }
 
 #[cfg(test)]

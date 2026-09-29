@@ -1,18 +1,18 @@
+use crate::guard::{self, FrameTarget};
+use crate::keys::ChordKey;
 use crate::protocol::ProtocolError;
-use crate::win_utils;
 use serde_json::json;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Instant;
 
-use windows::Win32::Foundation::{HWND, POINT};
+use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN,
-    MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_VIRTUALDESK, MOUSEINPUT,
-};
-use windows::Win32::UI::WindowsAndMessaging::{
-    GetAncestor, GetForegroundWindow, GetSystemMetrics, WindowFromPoint, GA_ROOT,
-    SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS,
+    KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN,
+    MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
+    MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL,
+    MOUSEINPUT, VIRTUAL_KEY,
 };
 
 #[allow(dead_code)]
@@ -42,7 +42,7 @@ pub struct AttachedIdentity {
     pub foreground_epoch: Arc<AtomicU64>,
 }
 
-fn get_window_details(hwnd: HWND) -> (String, u32) {
+pub fn get_window_details(hwnd: HWND) -> (String, u32) {
     if hwnd.0.is_null() {
         return ("".into(), 0);
     }
@@ -59,20 +59,261 @@ fn get_window_details(hwnd: HWND) -> (String, u32) {
     }
 }
 
-use serde::Deserialize;
+// ---------------------------------------------------------------------------
+// Uniform pointer target
+// ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct ClickArgs {
-    pub observation_id: u64,
-    pub target_bbox_frame_px: [i32; 4],
-    #[serde(default = "default_max_age_ms")]
-    pub max_age_ms: u64,
+/// The one uniform pointer target argument every pointer action accepts.
+///
+/// Either form is expressed in the pixels of the observation the caller saw. A
+/// bare screen coordinate has no representation here, for the same reason the
+/// original click did not accept one.
+#[derive(Debug, Clone, serde::Deserialize, Default)]
+pub struct TargetArg {
     #[serde(default)]
-    pub dry_run: bool,
+    pub bbox_frame_px: Option<[i32; 4]>,
+    #[serde(default)]
+    pub point_frame_px: Option<[i32; 2]>,
+}
+
+/// Resolve a pointer target, accepting the legacy flat `target_bbox_frame_px`
+/// spelling used by the original click so that existing callers are unchanged.
+pub fn resolve_target(
+    target: Option<&TargetArg>,
+    legacy_bbox: Option<[i32; 4]>,
+) -> Result<FrameTarget, ProtocolError> {
+    if let Some(t) = target {
+        match (&t.bbox_frame_px, &t.point_frame_px) {
+            (Some(_), Some(_)) => {
+                return Err(ProtocolError::new(
+                    "invalid_request",
+                    "Pointer target accepts either 'bbox_frame_px' or 'point_frame_px', not both",
+                ));
+            }
+            (Some(b), None) => {
+                return Ok(FrameTarget::Bbox { x: b[0], y: b[1], w: b[2], h: b[3] });
+            }
+            (None, Some(p)) => {
+                return Ok(FrameTarget::Point { x: p[0], y: p[1] });
+            }
+            (None, None) => {
+                return Err(ProtocolError::new(
+                    "invalid_request",
+                    "Pointer target requires 'bbox_frame_px' or 'point_frame_px'",
+                ));
+            }
+        }
+    }
+
+    match legacy_bbox {
+        Some(b) => Ok(FrameTarget::Bbox { x: b[0], y: b[1], w: b[2], h: b[3] }),
+        None => Err(ProtocolError::new(
+            "invalid_request",
+            "Missing pointer target: supply 'target' with 'bbox_frame_px' or 'point_frame_px'",
+        )),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared input injection
+// ---------------------------------------------------------------------------
+
+/// Inject a sequence of input events.
+///
+/// This is the single place input reaches the operating system. It checks that
+/// every event was accepted; on a partial failure it releases anything still held
+/// so a stuck button or modifier does not silently remain down, and reports how
+/// many events were actually injected. No action retries after a partial or
+/// ambiguous dispatch.
+pub fn inject(inputs: &[INPUT], cleanup: &[INPUT]) -> Result<u32, ProtocolError> {
+    if inputs.is_empty() {
+        return Ok(0);
+    }
+    let count = unsafe { SendInput(inputs, std::mem::size_of::<INPUT>() as i32) };
+    if count as usize != inputs.len() {
+        if !cleanup.is_empty() {
+            unsafe {
+                SendInput(cleanup, std::mem::size_of::<INPUT>() as i32);
+            }
+        }
+        return Err(ProtocolError::new(
+            "input_failed",
+            format!("SendInput injected only {}/{} events", count, inputs.len()),
+        ));
+    }
+    Ok(count)
+}
+
+// ---------------------------------------------------------------------------
+// Event builders
+// ---------------------------------------------------------------------------
+
+/// Normalize a physical point into the absolute 0..65535 virtual desktop space.
+pub fn normalize_to_virtual(
+    screen_x: i32,
+    screen_y: i32,
+    virtual_screen: (i32, i32, i32, i32),
+) -> (i32, i32) {
+    let (vx, vy, vw, vh) = virtual_screen;
+    let norm_x = (((screen_x - vx) as f64 + 0.5) * 65536.0 / vw as f64) as i32;
+    let norm_y = (((screen_y - vy) as f64 + 0.5) * 65536.0 / vh as f64) as i32;
+    (norm_x, norm_y)
+}
+
+pub fn mouse_move_input(screen_x: i32, screen_y: i32, virtual_screen: (i32, i32, i32, i32)) -> INPUT {
+    let (norm_x, norm_y) = normalize_to_virtual(screen_x, screen_y, virtual_screen);
+    INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dx: norm_x,
+                dy: norm_y,
+                mouseData: 0,
+                dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    }
+}
+
+/// A mouse button press or release at an already-normalized absolute position.
+pub fn mouse_button_input(norm_x: i32, norm_y: i32, down: bool, button: MouseButton) -> INPUT {
+    let flag = match (button, down) {
+        (MouseButton::Left, true) => MOUSEEVENTF_LEFTDOWN,
+        (MouseButton::Left, false) => MOUSEEVENTF_LEFTUP,
+        (MouseButton::Right, true) => MOUSEEVENTF_RIGHTDOWN,
+        (MouseButton::Right, false) => MOUSEEVENTF_RIGHTUP,
+        (MouseButton::Middle, true) => MOUSEEVENTF_MIDDLEDOWN,
+        (MouseButton::Middle, false) => MOUSEEVENTF_MIDDLEUP,
+    };
+    INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dx: norm_x,
+                dy: norm_y,
+                mouseData: 0,
+                dwFlags: flag | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    }
+}
+
+pub fn wheel_input(norm_x: i32, norm_y: i32, notches: i32) -> INPUT {
+    INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dx: norm_x,
+                dy: norm_y,
+                mouseData: (notches * 120) as u32,
+                dwFlags: MOUSEEVENTF_WHEEL | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    }
+}
+
+pub fn key_input(vk: u16, up: bool) -> INPUT {
+    let mut flags = KEYBD_EVENT_FLAGS(0);
+    if up {
+        flags = flags | KEYEVENTF_KEYUP;
+    }
+    INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VIRTUAL_KEY(vk),
+                wScan: 0,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    }
+}
+
+/// A single UTF-16 code unit delivered as a Unicode key event.
+///
+/// Sending one code unit at a time is what lets a character outside the Basic
+/// Multilingual Plane arrive intact: the engine sends its surrogate pair as two
+/// consecutive events and the receiving application reassembles it.
+pub fn unicode_key_input(code_unit: u16, up: bool) -> INPUT {
+    let mut flags = KEYEVENTF_UNICODE;
+    if up {
+        flags = flags | KEYEVENTF_KEYUP;
+    }
+    INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VIRTUAL_KEY(0),
+                wScan: code_unit,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    }
+}
+
+pub fn key_input_for(key: ChordKey, up: bool) -> INPUT {
+    match key {
+        ChordKey::Virtual(vk) => key_input(vk, up),
+        ChordKey::Character(unit) => unicode_key_input(unit, up),
+    }
+}
+
+/// The release events for buttons a partial failure could leave held.
+pub fn release_all_buttons_input(virtual_screen: (i32, i32, i32, i32)) -> Vec<INPUT> {
+    let (nx, ny) = normalize_to_virtual(0, 0, virtual_screen);
+    vec![
+        mouse_button_input(nx, ny, false, MouseButton::Left),
+        mouse_button_input(nx, ny, false, MouseButton::Right),
+        mouse_button_input(nx, ny, false, MouseButton::Middle),
+    ]
+}
+
+// ---------------------------------------------------------------------------
+// Click
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MouseButton {
+    Left,
+    Right,
+    Middle,
 }
 
 fn default_max_age_ms() -> u64 {
-    500
+    guard::DEFAULT_MAX_AGE_MS
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ClickArgs {
+    pub observation_id: u64,
+    /// Legacy flat bounding box, retained so existing callers are unchanged.
+    #[serde(default)]
+    pub target_bbox_frame_px: Option<[i32; 4]>,
+    /// Uniform pointer target.
+    #[serde(default)]
+    pub target: Option<TargetArg>,
+    #[serde(default = "default_max_age_ms")]
+    pub max_age_ms: u64,
+    /// Retained with the original default of false.
+    #[serde(default)]
+    pub dry_run: bool,
+    /// Defaults to a single left click, which is the already verified behaviour.
+    #[serde(default)]
+    pub button: Option<MouseButton>,
+    /// 1 for a single click, 2 for a double click.
+    #[serde(default)]
+    pub click_count: Option<u32>,
 }
 
 pub fn execute_guarded_click(
@@ -80,250 +321,70 @@ pub fn execute_guarded_click(
     last_obs: Option<&LastObservation>,
     args: ClickArgs,
 ) -> Result<serde_json::Value, ProtocolError> {
-    let req_obs_id = args.observation_id;
-    let [bx, by, bw, bh] = args.target_bbox_frame_px;
-    let max_age_ms = args.max_age_ms;
-    let dry_run = args.dry_run;
-
-    let obs = match last_obs {
-        Some(o) => o,
-        None => {
-            return Err(ProtocolError::new(
-                "stale_observation",
-                "No observation recorded",
-            ));
-        }
-    };
-
-    if obs.observation_id != req_obs_id {
+    let button = args.button.unwrap_or(MouseButton::Left);
+    let click_count = args.click_count.unwrap_or(1);
+    if click_count == 0 || click_count > 2 {
         return Err(ProtocolError::new(
-            "stale_observation",
-            format!(
-                "Observation id mismatch: requested {}, current latest is {}",
-                req_obs_id, obs.observation_id
-            ),
+            "invalid_request",
+            format!("click_count must be 1 or 2, got {}", click_count),
         ));
     }
 
-    let age_ms = obs.published_instant.elapsed().as_millis() as u64;
-    if age_ms > max_age_ms {
-        return Err(ProtocolError::new(
-            "stale_observation",
-            format!(
-                "Observation expired: age {} ms exceeds max allowed {} ms",
-                age_ms, max_age_ms
-            ),
-        ));
-    }
+    let target = resolve_target(args.target.as_ref(), args.target_bbox_frame_px)?;
 
-    if bx < 0 || by < 0 || bw <= 0 || bh <= 0
-        || (bx + bw) as u32 > obs.width
-        || (by + bh) as u32 > obs.height
-    {
-        return Err(ProtocolError::new(
-            "invalid_coordinates",
-            format!(
-                "Target bbox [{}, {}, {}, {}] is outside frame dimensions [{}x{}]",
-                bx, by, bw, bh, obs.width, obs.height
-            ),
-        ));
-    }
+    // One shared guard, identical for every click variant. Only the injected
+    // flags and repetition differ below.
+    let plan = guard::plan_pointer_action(
+        attached,
+        last_obs,
+        args.observation_id,
+        args.max_age_ms,
+        &target,
+    )?;
 
-    win_utils::check_interactive_desktop()
-        .map_err(|e| ProtocolError::new("desktop_inaccessible", e))?;
-
-    let center_frame_x = bx + bw / 2;
-    let center_frame_y = by + bh / 2;
-
-    let (screen_x, screen_y) = if obs.target_type == "monitor" {
-        (obs.bounds_x + center_frame_x, obs.bounds_y + center_frame_y)
+    let hit_hwnd = HWND(plan.hit_hwnd as *mut _);
+    let hit_root = if plan.hit_root_hwnd != 0 {
+        HWND(plan.hit_root_hwnd as *mut _)
     } else {
-        let att = match attached {
-            Some(a) => a,
-            None => {
-                return Err(ProtocolError::new("invalid_request", "No window target attached"));
-            }
-        };
-
-        win_utils::validate_window_identity(att.hwnd_num, att.pid, &att.create_time)
-            .map_err(|e| ProtocolError::new("window_gone", format!("Window identity invalid: {}", e)))?;
-
-        let target_hwnd = HWND(att.hwnd_num as *mut _);
-
-        let fg_hwnd = unsafe { GetForegroundWindow() };
-        let fg_root = unsafe { GetAncestor(fg_hwnd, GA_ROOT) };
-        if fg_hwnd != target_hwnd && fg_root != target_hwnd {
-            att.foreground_epoch.fetch_add(1, Ordering::SeqCst);
-            return Err(ProtocolError::new(
-                "foreground_changed",
-                format!(
-                    "Target window is not in the foreground (current foreground is {:?})",
-                    fg_hwnd.0
-                ),
-            ));
-        }
-
-        let cur_bounds = win_utils::get_window_extended_frame_bounds(target_hwnd)
-            .map_err(|e| ProtocolError::new("geometry_changed", e))?;
-
-        if cur_bounds.x != obs.bounds_x
-            || cur_bounds.y != obs.bounds_y
-            || cur_bounds.w != obs.bounds_w
-            || cur_bounds.h != obs.bounds_h
-        {
-            att.geometry_epoch.fetch_add(1, Ordering::SeqCst);
-            return Err(ProtocolError::new(
-                "geometry_changed",
-                format!(
-                    "Window bounds moved/resized from ({}, {}, {}, {}) to ({}, {}, {}, {})",
-                    obs.bounds_x, obs.bounds_y, obs.bounds_w, obs.bounds_h,
-                    cur_bounds.x, cur_bounds.y, cur_bounds.w, cur_bounds.h
-                ),
-            ));
-        }
-
-        let sx = cur_bounds.x + center_frame_x;
-        let sy = cur_bounds.y + center_frame_y;
-
-        let hwnd_at_pt = unsafe { WindowFromPoint(POINT { x: sx, y: sy }) };
-        let root_at_pt = unsafe { GetAncestor(hwnd_at_pt, GA_ROOT) };
-        if hwnd_at_pt != target_hwnd && root_at_pt != target_hwnd {
-            return Err(ProtocolError::new(
-                "target_occluded",
-                format!(
-                    "Target point ({}, {}) is occluded by another window {:?} (root {:?})",
-                    sx, sy, hwnd_at_pt.0, root_at_pt.0
-                ),
-            ));
-        }
-
-        (sx, sy)
+        hit_hwnd
     };
+    let (target_title, target_pid) = get_window_details(hit_root);
 
-    let vx = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
-    let vy = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
-    let vw = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
-    let vh = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) };
-
-    if vw <= 0 || vh <= 0 {
-        return Err(ProtocolError::new(
-            "input_failed",
-            "Virtual screen dimensions are invalid",
-        ));
-    }
-
-    if screen_x < vx || screen_x >= vx + vw || screen_y < vy || screen_y >= vy + vh {
-        return Err(ProtocolError::new(
-            "invalid_coordinates",
-            format!("Screen coordinates ({}, {}) outside virtual screen bounds", screen_x, screen_y),
-        ));
-    }
-
-    let hwnd_at_pt = unsafe { WindowFromPoint(POINT { x: screen_x, y: screen_y }) };
-    let root_at_pt = unsafe { GetAncestor(hwnd_at_pt, GA_ROOT) };
-    let (target_title, target_pid) = get_window_details(if !root_at_pt.0.is_null() { root_at_pt } else { hwnd_at_pt });
-
-    if dry_run {
-        return Ok(json!({
-            "status": "dry_run",
-            "observation_id": obs.observation_id,
-            "target_type": obs.target_type,
-            "screen_x": screen_x,
-            "screen_y": screen_y,
-            "hit_window": {
-                "hwnd": (hwnd_at_pt.0 as usize).to_string(),
-                "root_hwnd": (root_at_pt.0 as usize).to_string(),
-                "title": target_title,
-                "pid": target_pid,
-            },
-            "age_ms": age_ms,
-            "events_injected": 0,
-        }));
-    }
-
-    // Pixel-center normalization across virtual desktop coordinates (0..65535)
-    let norm_x = (((screen_x - vx) as f64 + 0.5) * 65536.0 / vw as f64) as i32;
-    let norm_y = (((screen_y - vy) as f64 + 0.5) * 65536.0 / vh as f64) as i32;
-
-    let inputs = [
-        INPUT {
-            r#type: INPUT_MOUSE,
-            Anonymous: INPUT_0 {
-                mi: MOUSEINPUT {
-                    dx: norm_x,
-                    dy: norm_y,
-                    mouseData: 0,
-                    dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
-                    time: 0,
-                    dwExtraInfo: 0,
-                },
-            },
-        },
-        INPUT {
-            r#type: INPUT_MOUSE,
-            Anonymous: INPUT_0 {
-                mi: MOUSEINPUT {
-                    dx: norm_x,
-                    dy: norm_y,
-                    mouseData: 0,
-                    dwFlags: MOUSEEVENTF_LEFTDOWN | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
-                    time: 0,
-                    dwExtraInfo: 0,
-                },
-            },
-        },
-        INPUT {
-            r#type: INPUT_MOUSE,
-            Anonymous: INPUT_0 {
-                mi: MOUSEINPUT {
-                    dx: norm_x,
-                    dy: norm_y,
-                    mouseData: 0,
-                    dwFlags: MOUSEEVENTF_LEFTUP | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
-                    time: 0,
-                    dwExtraInfo: 0,
-                },
-            },
-        },
-    ];
-
-    let count = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
-    if count != 3 {
-        let release = [INPUT {
-            r#type: INPUT_MOUSE,
-            Anonymous: INPUT_0 {
-                mi: MOUSEINPUT {
-                    dx: norm_x,
-                    dy: norm_y,
-                    mouseData: 0,
-                    dwFlags: MOUSEEVENTF_LEFTUP | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
-                    time: 0,
-                    dwExtraInfo: 0,
-                },
-            },
-        }];
-        unsafe {
-            SendInput(&release, std::mem::size_of::<INPUT>() as i32);
-        }
-        return Err(ProtocolError::new(
-            "input_failed",
-            format!("SendInput injected only {}/3 events", count),
-        ));
-    }
-
-    Ok(json!({
-        "status": "clicked",
-        "observation_id": obs.observation_id,
-        "target_type": obs.target_type,
-        "screen_x": screen_x,
-        "screen_y": screen_y,
+    let mut result = json!({
+        "status": if args.dry_run { "dry_run" } else { "clicked" },
+        "action": "click",
+        "observation_id": plan.observation_id,
+        "target_type": plan.target_type,
+        "screen_x": plan.screen_x,
+        "screen_y": plan.screen_y,
         "hit_window": {
-            "hwnd": (hwnd_at_pt.0 as usize).to_string(),
-            "root_hwnd": (root_at_pt.0 as usize).to_string(),
+            "hwnd": plan.hit_hwnd.to_string(),
+            "root_hwnd": plan.hit_root_hwnd.to_string(),
             "title": target_title,
             "pid": target_pid,
         },
-        "age_ms": age_ms,
-        "events_injected": count,
-    }))
+        "age_ms": plan.age_ms,
+        "button": format!("{:?}", button).to_lowercase(),
+        "click_count": click_count,
+    });
+
+    if args.dry_run {
+        result["events_injected"] = json!(0);
+        return Ok(result);
+    }
+
+    let move_ev = mouse_move_input(plan.screen_x, plan.screen_y, plan.virtual_screen);
+    let (nx, ny) = normalize_to_virtual(plan.screen_x, plan.screen_y, plan.virtual_screen);
+
+    let mut inputs: Vec<INPUT> = Vec::with_capacity(1 + (click_count as usize) * 2);
+    inputs.push(move_ev);
+    for _ in 0..click_count {
+        inputs.push(mouse_button_input(nx, ny, true, button));
+        inputs.push(mouse_button_input(nx, ny, false, button));
+    }
+
+    let cleanup = release_all_buttons_input(plan.virtual_screen);
+    let count = inject(&inputs, &cleanup)?;
+    result["events_injected"] = json!(count);
+    Ok(result)
 }

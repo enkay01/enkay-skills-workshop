@@ -6,7 +6,38 @@ The specs and phases describe increments of one maintained tool. The Rust engine
 
 **Location:** `enkay-skills-workshop/windows-computer-use`  
 **Platform:** Windows 11 Pro (x64)  
-**Status:** Phases 0–6 Implemented, Empirically Benchmarked & Verified  
+**Status:** Phases 0–7 Implemented, Empirically Benchmarked & Verified  
+
+## Desktop actions
+
+The engine drives more than a single click. Alongside `click` it exposes
+`type_text`, `press_key`, `scroll`, `hover`, `drag`, and `focus_window`:
+
+```python
+client.type_text("Hello Desktop 42")
+client.press_key("ctrl+shift+s")
+client.scroll(notches_x=4, observation_id=obs_id, target=client.target(bbox_frame_px=box))
+client.hover(observation_id=obs_id, target=client.target(bbox_frame_px=box))
+client.drag(from_target=src, to_target=dst, observation_id=obs_id)
+client.focus_window(hwnd, pid=pid, process_create_time_utc=created)
+```
+
+Every one of them runs the same pre-dispatch guard before anything is injected:
+observation freshness, target type, window geometry, hit-test ownership, and
+virtual-screen bounds. That guard is a single implementation in
+`engine/src/guard.rs` which `click` also uses, so a new action cannot acquire a
+weaker safety check than the original click. A refusal is reported as a distinct
+error code and no input is dispatched.
+
+Verified effects, refusals, and measured latency are recorded in
+[desktop-action-expansion-results.md](research/desktop-action-expansion-results.md).
+Latency is a measurement, not a threshold: nothing in the suite fails on a
+timing number. Targeted actions dispatch in roughly 0.65–3.8 ms.
+
+Limits worth knowing: `inject()` releases held buttons and modifiers on a
+partial `SendInput` failure and never retries, but that release path is
+implemented and reasoned about rather than exercised by the suite. `focus_window`
+takes a deliberate 120 ms settle before verifying.
 
 ## First model-controlled interaction
 
@@ -37,7 +68,7 @@ This module provides a persistent, low-latency Windows desktop computer use engi
    - User-session persistent child process over binary-framed stdio pipe (4-byte length prefix).
    - In-memory Windows Graphics Capture (WGC) via Direct3D 11 staging texture readback (**14.2 ms** median frame acquisition, zero disk writes).
    - Native UI Automation (UIA) COM traversal and pattern invocation (`InvokePattern`, `ValuePattern`).
-   - Guarded Win32 `SendInput` physical mouse injection with virtual desktop normalization across monitor coordinates.
+   - Guarded Win32 `SendInput` physical mouse, keyboard, and wheel injection with virtual desktop normalization across monitor coordinates.
 2. **Python Client & Workflow Controller (`client/`):**
    - Protocol transport with reentrant locking, non-blocking stderr draining, and request deadlines (`wcu_client.py`).
    - High-precision local OCR via RapidOCR (`client/recognition.py`) with ROI cropping and coordinate re-projection.
@@ -52,6 +83,9 @@ windows-computer-use/
 │       ├── capture.rs           <-- Dedicated MTA WGC capture worker & staging readback
 │       ├── uia.rs               <-- Dedicated MTA COM UIA inspection & action worker
 │       ├── input.rs             <-- Guarded SendInput dispatch with foreground/hit-test checks
+│       ├── guard.rs             <-- Shared pre-dispatch safety checks used by every action
+│       ├── actions.rs           <-- type_text, press_key, scroll, hover, drag & their limits
+│       ├── keys.rs              <-- Key/chord vocabulary
 │       ├── win_utils.rs         <-- Window enumeration, bounds, and desktop synchronization
 │       └── protocol.rs          <-- Binary message framing & error typing
 ├── client/                      <-- Python client and visual workflow
@@ -68,9 +102,11 @@ windows-computer-use/
 │   ├── test_phase3_uia.py       <-- Native UIA inspection & semantic actions
 │   ├── test_phase4_recognition.py <-- RapidOCR target gating & abstention suite
 │   ├── test_phase5_guarded_click.py <-- Live guarded SendInput & negative gates
-│   └── test_phase6_workflow.py  <-- Bounded state machine transitions
+│   ├── test_phase6_workflow.py  <-- Bounded state machine transitions
+│   └── test_phase7_desktop_actions.py <-- Typing, keys, scroll, hover, drag, focus
 └── research/
     ├── implementation-results.md <-- Full empirical measurements & benchmark data
+    ├── desktop-action-expansion-results.md <-- Phase 7 verified effects & latency
     └── *.md                     <-- Findings and measured results
 ```
 
@@ -125,7 +161,17 @@ python tests/test_phase5_guarded_click.py
 
 # Phase 6: Bounded Continue workflow state machine
 python tests/test_phase6_workflow.py
+
+# Phase 7: Typing, key chords, scrolling, hover, drag, window switching
+python -m pytest tests/test_phase7_desktop_actions.py --timeout=300
+
+# Everything (67 tests). Needs a real interactive desktop; there is no headless path.
+python -m pytest tests/ --timeout=300 -q
 ```
+
+On Windows, set `PYTHONIOENCODING=utf-8` before running these. The console
+defaults to cp1252 and the suites print non-ASCII fixture text, so their own
+progress output can raise `UnicodeEncodeError` and look like a test failure.
 
 ### Running the Bounded Continue Workflow
 ```powershell

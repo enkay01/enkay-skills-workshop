@@ -12,7 +12,7 @@ import struct
 import subprocess
 import threading
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 
 PROTOCOL_VERSION = 1
@@ -42,6 +42,7 @@ class WcuClient:
         self._stderr_thread: Optional[threading.Thread] = None
         self._stderr_lines: List[str] = []
         self._is_alive = False
+        self._stopping = False
 
     def start(self) -> None:
         with self._lock:
@@ -76,7 +77,13 @@ class WcuClient:
     def _stop_locked(self) -> None:
         if self._proc is None:
             return
+        # _raw_request calls back into this method when the engine fails to
+        # answer. Without this guard, a shutdown that itself times out would
+        # recurse until the stack ran out.
+        if self._stopping:
+            return
         proc = self._proc
+        self._stopping = True
         try:
             if proc.poll() is None:
                 # Attempt clean shutdown request if pipes are open
@@ -84,12 +91,14 @@ class WcuClient:
                     self._raw_request("shutdown", {}, timeout_sec=1.0)
                 except Exception:
                     pass
-                proc.terminate()
-                proc.wait(timeout=2.0)
-        except Exception:
-            if proc.poll() is None:
-                proc.kill()
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=2.0)
+                except Exception:
+                    if proc.poll() is None:
+                        proc.kill()
         finally:
+            self._stopping = False
             self._proc = None
             self._is_alive = False
 
@@ -269,8 +278,27 @@ class WcuClient:
             )
             return meta, payload
 
-    def focus_window(self, hwnd: str | int, attach: bool = False) -> Dict[str, Any]:
-        result = self.request("focus_window", {"hwnd": str(hwnd)})
+    def focus_window(
+        self,
+        hwnd: str | int,
+        attach: bool = False,
+        pid: Optional[int] = None,
+        process_create_time_utc: Optional[str] = None,
+        timeout_sec: float = 5.0,
+    ) -> Dict[str, Any]:
+        """Bring a window to the front and verify the result.
+
+        The engine restores the window if minimized, requests the foreground, and
+        then verifies against the actual foreground window rather than trusting
+        the request. A window that refuses foreground raises `focus_refused` and
+        names the window that actually holds it.
+        """
+        args: Dict[str, Any] = {"hwnd": str(hwnd)}
+        if pid is not None:
+            args["pid"] = pid
+        if process_create_time_utc is not None:
+            args["process_create_time_utc"] = process_create_time_utc
+        result = self.request("focus_window", args, timeout_sec=timeout_sec)
         if attach:
             windows = self.list_windows()
             matching = [w for w in windows if str(w.get("hwnd")) == str(hwnd)]
@@ -282,6 +310,47 @@ class WcuClient:
                     target["process_create_time_utc"],
                 )
         return result
+
+    def switch_window(
+        self,
+        hwnd: str | int,
+        pid: Optional[int] = None,
+        process_create_time_utc: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Focus a window, re-attach the engine to it, and observe it afresh.
+
+        The engine owns exactly one capture target, and focusing a window does not
+        by itself move that target. Composing the three steps here means a caller
+        cannot accidentally focus one window and keep observing another. A fresh
+        observation is required afterwards, because the engine cleared the previous
+        window's observation when the focus changed.
+        """
+        focus = self.focus_window(
+            hwnd,
+            pid=pid,
+            process_create_time_utc=process_create_time_utc,
+        )
+        windows = self.list_windows()
+        matching = [w for w in windows if str(w.get("hwnd")) == str(hwnd)]
+        if not matching:
+            raise WcuError(
+                "window_gone",
+                f"Focused window {hwnd} is no longer listed",
+                focus,
+            )
+        target = matching[0]
+        attach = self.attach(
+            target["hwnd"],
+            target["pid"],
+            target["process_create_time_utc"],
+        )
+        meta, _payload = self.observe()
+        return {
+            "focus": focus,
+            "attach": attach,
+            "observation_id": meta.get("observation_id"),
+            "window_identity": meta.get("window_identity"),
+        }
 
     def detach(self) -> Dict[str, Any]:
         return self.request("detach")
@@ -338,24 +407,209 @@ class WcuClient:
             timeout_sec=timeout_sec,
         )
 
+    @staticmethod
+    def target(
+        bbox_frame_px: Optional[List[int]] = None,
+        point_frame_px: Optional[List[int]] = None,
+    ) -> Dict[str, Any]:
+        """Build the one uniform pointer target argument every pointer action accepts.
+
+        A target is expressed in the pixels of the observation the caller saw:
+        either a bounding box, whose centre is used, or a point. A bare screen
+        coordinate is deliberately not expressible, for the same reason the
+        original click did not accept one.
+        """
+        if bbox_frame_px is not None and point_frame_px is not None:
+            raise ValueError("Pass either bbox_frame_px or point_frame_px, not both")
+        if bbox_frame_px is not None:
+            if len(bbox_frame_px) != 4:
+                raise ValueError("bbox_frame_px must be [x, y, w, h]")
+            return {"bbox_frame_px": [int(v) for v in bbox_frame_px]}
+        if point_frame_px is not None:
+            if len(point_frame_px) != 2:
+                raise ValueError("point_frame_px must be [x, y]")
+            return {"point_frame_px": [int(v) for v in point_frame_px]}
+        raise ValueError("A pointer action needs bbox_frame_px or point_frame_px")
+
     def click(
         self,
         observation_id: int,
-        target_bbox_frame_px: List[int],
+        target_bbox_frame_px: Optional[List[int]] = None,
         max_age_ms: int = 500,
         dry_run: bool = False,
         timeout_sec: float = 5.0,
+        *,
+        target: Optional[Dict[str, Any]] = None,
+        button: str = "left",
+        click_count: int = 1,
     ) -> Dict[str, Any]:
-        return self.request(
-            "click",
-            {
-                "observation_id": observation_id,
-                "target_bbox_frame_px": target_bbox_frame_px,
-                "max_age_ms": max_age_ms,
-                "dry_run": dry_run,
-            },
-            timeout_sec=timeout_sec,
-        )
+        """Dispatch a click through the shared guard.
+
+        `target_bbox_frame_px` is the original spelling and is unchanged. A caller
+        that prefers the uniform argument can pass `target` instead. Both
+        `button` and `click_count` default to the already verified single left
+        click, and every variant runs the identical guard.
+        """
+        args: Dict[str, Any] = {
+            "observation_id": observation_id,
+            "max_age_ms": max_age_ms,
+            "dry_run": dry_run,
+            "button": button,
+            "click_count": click_count,
+        }
+        if target is not None:
+            args["target"] = target
+        elif target_bbox_frame_px is not None:
+            args["target_bbox_frame_px"] = list(target_bbox_frame_px)
+        else:
+            raise ValueError("click needs target_bbox_frame_px or target")
+        return self.request("click", args, timeout_sec=timeout_sec)
+
+    def type_text(
+        self,
+        text: str,
+        observation_id: Optional[int] = None,
+        max_age_ms: int = 500,
+        delay_ms: Optional[int] = None,
+        dry_run: bool = False,
+        timeout_sec: float = 20.0,
+    ) -> Dict[str, Any]:
+        """Type text as Unicode key events, one UTF-16 code unit at a time.
+
+        Keyboard actions bind to window identity and foreground rather than to a
+        point, so no pointer target is accepted here. Supplying an observation id
+        additionally binds the action to that frame.
+        """
+        args: Dict[str, Any] = {
+            "text": text,
+            "max_age_ms": max_age_ms,
+            "dry_run": dry_run,
+        }
+        if observation_id is not None:
+            args["observation_id"] = observation_id
+        if delay_ms is not None:
+            args["delay_ms"] = delay_ms
+        return self.request("type_text", args, timeout_sec=timeout_sec)
+
+    def press_key(
+        self,
+        chord: str,
+        observation_id: Optional[int] = None,
+        max_age_ms: int = 500,
+        repeat: Optional[int] = None,
+        hold_ms: Optional[int] = None,
+        dry_run: bool = False,
+        timeout_sec: float = 10.0,
+    ) -> Dict[str, Any]:
+        """Send a key chord such as `ctrl+shift+s` as a single call.
+
+        An unrecognised key name is refused with the `unknown_key` error code
+        before any event is generated.
+        """
+        args: Dict[str, Any] = {
+            "chord": chord,
+            "max_age_ms": max_age_ms,
+            "dry_run": dry_run,
+        }
+        if observation_id is not None:
+            args["observation_id"] = observation_id
+        if repeat is not None:
+            args["repeat"] = repeat
+        if hold_ms is not None:
+            args["hold_ms"] = hold_ms
+        return self.request("press_key", args, timeout_sec=timeout_sec)
+
+    def scroll(
+        self,
+        notches_x: int = 0,
+        notches_y: int = 0,
+        observation_id: Optional[int] = None,
+        max_age_ms: int = 500,
+        dry_run: bool = False,
+        timeout_sec: float = 5.0,
+        *,
+        target: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Scroll in wheel notches, optionally at one uniform pointer target.
+
+        Without a target the wheel is sent at the current pointer position, and
+        the result reports that the hit-test ownership check did not apply.
+        """
+        args: Dict[str, Any] = {
+            "notches_x": notches_x,
+            "notches_y": notches_y,
+            "max_age_ms": max_age_ms,
+            "dry_run": dry_run,
+        }
+        if observation_id is not None:
+            args["observation_id"] = observation_id
+        if target is not None:
+            args["target"] = target
+        return self.request("scroll", args, timeout_sec=timeout_sec)
+
+    def hover(
+        self,
+        observation_id: int,
+        target: Optional[Dict[str, Any]] = None,
+        max_age_ms: int = 500,
+        dry_run: bool = False,
+        duration_ms: Optional[int] = None,
+        timeout_sec: float = 5.0,
+        *,
+        target_bbox_frame_px: Optional[List[int]] = None,
+    ) -> Dict[str, Any]:
+        """Move the pointer to a target without changing any button state."""
+        args: Dict[str, Any] = {
+            "observation_id": observation_id,
+            "max_age_ms": max_age_ms,
+            "dry_run": dry_run,
+        }
+        if target is not None:
+            args["target"] = target
+        elif target_bbox_frame_px is not None:
+            args["target_bbox_frame_px"] = list(target_bbox_frame_px)
+        else:
+            raise ValueError("hover needs target or target_bbox_frame_px")
+        if duration_ms is not None:
+            args["duration_ms"] = duration_ms
+        return self.request("hover", args, timeout_sec=timeout_sec)
+
+    def drag(
+        self,
+        from_target: Dict[str, Any],
+        to_target: Dict[str, Any],
+        observation_id: int,
+        max_age_ms: int = 500,
+        dry_run: bool = False,
+        steps: Optional[int] = None,
+        duration_ms: Optional[int] = None,
+        timeout_sec: float = 10.0,
+    ) -> Dict[str, Any]:
+        """Drag from one observed-frame target to another.
+
+        Both endpoints must lie inside the observed frame, so a drag that would
+        have to leave the attached window is not expressible.
+        """
+        args: Dict[str, Any] = {
+            "observation_id": observation_id,
+            "from": from_target,
+            "to": to_target,
+            "max_age_ms": max_age_ms,
+            "dry_run": dry_run,
+        }
+        if steps is not None:
+            args["steps"] = steps
+        if duration_ms is not None:
+            args["duration_ms"] = duration_ms
+        return self.request("drag", args, timeout_sec=timeout_sec)
+
+    def capabilities(self) -> Dict[str, Any]:
+        """The engine's capability report, including the action vocabulary."""
+        return self.request("doctor")
+
+    def actions(self) -> List[str]:
+        """The action names this engine supports, for discovery."""
+        return list(self.capabilities().get("actions", []))
 
     def __enter__(self) -> WcuClient:
         self.start()
