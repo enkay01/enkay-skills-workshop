@@ -3,3 +3,11 @@ target/
 .DS_Store
 *.swp
 *.log
+__pycache__/
+*.py[cod]
+windows-computer-use/tests/fixture_app/bin/
+windows-computer-use/tests/fixture_app/obj/
+windows-computer-use/tests/fixture_app/*.csproj.user
+windows-computer-use/scratch/
+fixture_log.txt
+windows-computer-use/fixture_log.txt
