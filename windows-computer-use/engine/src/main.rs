@@ -1,5 +1,8 @@
+mod actions;
 mod capture;
+mod guard;
 mod input;
+mod keys;
 mod protocol;
 mod uia;
 mod win_utils;
@@ -32,6 +35,20 @@ struct AttachedTarget {
     geometry_epoch: Arc<AtomicU64>,
     foreground_epoch: Arc<AtomicU64>,
 }
+
+/// The action vocabulary this engine supports.
+///
+/// Reported by the capability check so a client or a model-facing tool can
+/// discover the vocabulary rather than hard-coding it.
+const SUPPORTED_ACTIONS: &[&str] = &[
+    "click",
+    "type_text",
+    "press_key",
+    "scroll",
+    "hover",
+    "drag",
+    "focus_window",
+];
 
 fn run_doctor() -> serde_json::Value {
     let desktop_status = match win_utils::check_interactive_desktop() {
@@ -92,6 +109,7 @@ fn run_doctor() -> serde_json::Value {
         "d3d11": d3d11_status,
         "wgc": wgc_supported,
         "dpi": dpi_status,
+        "actions": SUPPORTED_ACTIONS,
     })
 }
 
@@ -521,6 +539,52 @@ fn main() {
                     }
                 }
             }
+            "type_text" | "press_key" | "scroll" | "hover" | "drag" => {
+                let identity = attached.as_ref().map(|att| input::AttachedIdentity {
+                    hwnd: att.hwnd.clone(),
+                    hwnd_num: att.hwnd_num,
+                    pid: att.pid,
+                    create_time: att.create_time.clone(),
+                    geometry_epoch: att.geometry_epoch.clone(),
+                    foreground_epoch: att.foreground_epoch.clone(),
+                });
+
+                if identity.is_none() {
+                    resp.ok = false;
+                    resp.error = Some(ProtocolError::new("invalid_request", "No target attached"));
+                    let _ = write_response(&mut writer, &resp, &[]);
+                    continue;
+                }
+
+                let outcome = match req.op.as_str() {
+                    "type_text" => serde_json::from_value::<actions::TypeTextArgs>(req.args.clone())
+                        .map_err(|e| ProtocolError::new("invalid_request", format!("Invalid type_text args: {e}")))
+                        .and_then(|a| actions::execute_type_text(identity.as_ref(), last_observation.as_ref(), a)),
+                    "press_key" => serde_json::from_value::<actions::PressKeyArgs>(req.args.clone())
+                        .map_err(|e| ProtocolError::new("invalid_request", format!("Invalid press_key args: {e}")))
+                        .and_then(|a| actions::execute_press_key(identity.as_ref(), last_observation.as_ref(), a)),
+                    "scroll" => serde_json::from_value::<actions::ScrollArgs>(req.args.clone())
+                        .map_err(|e| ProtocolError::new("invalid_request", format!("Invalid scroll args: {e}")))
+                        .and_then(|a| actions::execute_scroll(identity.as_ref(), last_observation.as_ref(), a)),
+                    "hover" => serde_json::from_value::<actions::HoverArgs>(req.args.clone())
+                        .map_err(|e| ProtocolError::new("invalid_request", format!("Invalid hover args: {e}")))
+                        .and_then(|a| actions::execute_hover(identity.as_ref(), last_observation.as_ref(), a)),
+                    "drag" => serde_json::from_value::<actions::DragArgs>(req.args.clone())
+                        .map_err(|e| ProtocolError::new("invalid_request", format!("Invalid drag args: {e}")))
+                        .and_then(|a| actions::execute_drag(identity.as_ref(), last_observation.as_ref(), a)),
+                    _ => unreachable!(),
+                };
+
+                match outcome {
+                    Ok(res) => {
+                        resp.result = res;
+                    }
+                    Err(e) => {
+                        resp.ok = false;
+                        resp.error = Some(e);
+                    }
+                }
+            }
             "focus_window" => {
                 let hwnd_str = match req.args.get("hwnd").and_then(|v| v.as_str()) {
                     Some(h) => h,
@@ -540,13 +604,45 @@ fn main() {
                         continue;
                     }
                 };
-                match win_utils::focus_window(hwnd_num) {
-                    Ok(()) => {
-                        resp.result = json!({ "status": "focused", "hwnd": hwnd_str });
+
+                let expected_pid = req.args.get("pid").and_then(|v| v.as_u64()).map(|v| v as u32);
+                let expected_create_time = req.args.get("process_create_time_utc").and_then(|v| v.as_str());
+
+                match win_utils::focus_window_verified(hwnd_num, expected_pid, expected_create_time) {
+                    Ok(outcome) => {
+                        // A successful focus change invalidates everything that
+                        // belonged to the previous foreground window: bump the
+                        // attached target's foreground epoch and drop the stored
+                        // observation, so a target chosen before switching cannot
+                        // be reused after it.
+                        if let Some(att) = attached.as_ref() {
+                            att.foreground_epoch.fetch_add(1, Ordering::SeqCst);
+                        }
+                        last_observation = None;
+
+                        resp.result = json!({
+                            "status": "focused",
+                            "hwnd": outcome.hwnd,
+                            "verified": outcome.verified,
+                            "restored_from_minimized": outcome.restored_from_minimized,
+                            "requested": outcome.requested,
+                            "previous_foreground": outcome.previous_foreground,
+                            "foreground": outcome.foreground,
+                            "foreground_epoch_bumped": attached.is_some(),
+                            "observation_cleared": true,
+                        });
                     }
-                    Err(e) => {
+                    Err(probe) => {
+                        let details = match probe.actual_foreground {
+                            Some(w) => json!({ "actual_foreground": w }),
+                            None => serde_json::Value::Null,
+                        };
                         resp.ok = false;
-                        resp.error = Some(ProtocolError::new("focus_failed", e));
+                        resp.error = Some(ProtocolError::with_details(
+                            probe.code,
+                            probe.message,
+                            details,
+                        ));
                     }
                 }
             }

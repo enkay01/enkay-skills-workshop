@@ -14,14 +14,16 @@ The user reports phases 1–4 complete and another agent planning phase 5. Sourc
 
 README and implementation-results.md claim phases 0–6 are verified. That conflicts with the user's reported status. The roadmap author inspected source but did not rerun desktop tests. Treat guarded input and workflow completion as awaiting reconciliation with the active implementation agent and its evidence. Code presence is not a verified milestone.
 
-A first vision-model session is now demonstrated against the native fixture: the model chose a click from a screenshot, the guarded engine dispatched it, a later screenshot led the model to report success, and the fixture counter independently read 1. Moving the window after observation stopped the click. The evidence is in `research/model-controlled-interaction-results.md`. The current Python client still lacks the complete generic keyboard, scroll, drag, and application-switching action set.
+A first vision-model session is now demonstrated against the native fixture: the model chose a click from a screenshot, the guarded engine dispatched it, a later screenshot led the model to report success, and the fixture counter independently read 1. Moving the window after observation stopped the click. The evidence is in `research/model-controlled-interaction-results.md`.
+
+The generic action set is now complete: `click` (left/right, single/double), `type_text`, `press_key`, `scroll`, `hover`, `drag`, and `focus_window`. Every action runs the same pre-dispatch guard, decomposed from click's original inline checks into one reusable implementation in `engine/src/guard.rs`, so a new action cannot acquire a weaker safety check than click. All effects were confirmed by reading the application's own reported state, and every refusal was confirmed to have dispatched nothing. 27 new tests plus the 40 pre-existing tests pass, the latter unchanged, which is the regression evidence for the guard refactor. Measured dispatch is 0.65–3.8 ms for targeted actions; latency is recorded, not enforced as a threshold. Evidence and limits are in `research/desktop-action-expansion-results.md`. That closes the action-surface part of milestone 2; the model-facing tool and general agent loop are untouched by it.
 
 ## Delivery milestones
 
 | Milestone | Deliverable | Completion evidence |
 | --- | --- | --- |
 | 1. Desktop engine | Persistent capture, window identities, UIA, local client | Existing phases 1–4 evidence, with limitations recorded |
-| 2. Reliable interaction | Guarded click plus keyboard text/keys, scrolling, mouse movement, drag, and explicit window focus/switching | Real fixture/app actions with fresh observations and correct failure reporting |
+| 2. Reliable interaction | Guarded click plus keyboard text/keys, scrolling, mouse movement, drag, and explicit window focus/switching | [Done] Real fixture actions with fresh observations and correct failure reporting; see `research/desktop-action-expansion-results.md` |
 | 3. Model-facing tool | Stable observe/action API returning model-readable images and metadata | One model sees an image, chooses an action, receives a result, and observes the actual change |
 | 4. General agent loop | Provider adapter, bounded observe/act/verify loop, cancellation, recovery, and session history | A multi-step task involving native apps and a custom-rendered interface without a bespoke OCR profile |
 | 5. Provider portability and delivery | Second model adapter, installation/startup instructions, capabilities and troubleshooting | Same engine and action schema used by two vision models; repeatable setup and task traces |
@@ -30,9 +32,11 @@ A first vision-model session is now demonstrated against the native fixture: the
 
 1. Let the phase-5 agent finish guarded clicking. Reconcile existing phase-5/6 code and report claims before duplicating work. Preserve foreground, geometry, and observation checks.
 2. Demonstrate the smallest real model loop immediately: capture -> encode an image in memory -> model chooses a click -> dispatch -> fresh image -> model verifies the result. Use a controlled desktop fixture. OCR must be optional.
-3. Expand the generic actions for actual desktop tasks: type text, key chords, scroll, right/double click, move/hover, drag, window discovery, and explicit focus/switch. Support cross-window dialogs and menus. Keep actions tied to observation/window identity.
+3. [Completed - Issue #4] Generic actions for actual desktop tasks: type text, key chords, scroll, right/double click, move/hover, drag, window discovery, and explicit focus/switch, all sharing one guard. Not yet extended to cross-window dialogs and menus, which remains open.
 4. [Completed - Issue #3] Desktop/monitor overview capture: monitor enumeration, Windows Graphics Capture for monitors, coordinate scaling/inversion transforms, guarded overview clicks with hit-testing, and window focusing contract implemented and tested.
-5. Run cross-application tasks, then plug in a second model provider without changing the Rust engine. Implement a host adapter such as MCP when the intended host supports it; keep the core API usable through ordinary model API calls too.
+5. Cross-window dialogs and menus: the action set is per-attached-window, and a dialog owned by a different top-level window is not yet a first-class target. Decide whether dialogs become attachable targets or require an explicit switch first.
+6. Exercise the `inject()` release path. It releases held buttons and modifiers on a partial `SendInput` failure and never retries, but provoking a genuine partial failure safely is unresolved, so it is implemented and reasoned about rather than tested.
+7. Run cross-application tasks, then plug in a second model provider without changing the Rust engine. Implement a host adapter such as MCP when the intended host supports it; keep the core API usable through ordinary model API calls too.
 
 ## Contracts that the model layer must resolve
 
