@@ -120,9 +120,29 @@ The model-facing session, the desktop-wide overview, and cross-application task 
 - Any claim that all applications accept synthetic input, restore foreground on demand, or tolerate rapid unthrottled typing.
 - Continued application-specific optimization for any particular game.
 
+## Delivery Status
+
+Recorded 30 September 2026, after the change was merged to `main` (commit `d0ff75f`, merge `062a424`). Evidence is in [`../research/desktop-action-expansion-results.md`](../research/desktop-action-expansion-results.md). 67 tests pass: the 27 new ones and the 40 pre-existing ones, the latter unchanged, which is the regression evidence that plain left-click behaviour was preserved.
+
+**Delivered and verified against the application's own reported state:** typing (ASCII, off-layout, and non-BMP as a verified surrogate pair), key chords, an unknown-key refusal, vertical and horizontal scrolling in both directions, targeted and untargeted scrolling, hover, timed hover, drag with mid-gesture continuity, right click, double click, uniform pointer targets, window switching, and a verified focus change that invalidates the previous window's observation.
+
+**Refusals proven to dispatch nothing:** moved or resized window, expired or mismatched observation, target outside the frame, occluded target, unknown key name, over-length text, over-length drag, and refused focus. Each was confirmed twice, by asserting the error code and by re-reading the application's state afterwards.
+
+**Deviation from this specification as written.** The testing decisions above say a refused focus is produced by "targeting a window that cannot take the foreground". The delivered mechanism is different and worth recording, because two earlier designs were tried and failed for reasons that are not obvious. A window on a private desktop is rejected as `window_gone` during the engine's window lookup, so it never reaches a focus attempt and proves nothing about refusal. A separate process asked to activate its own window and lock it never succeeded, because `SetForegroundWindow` has eligibility conditions a freshly launched process does not meet, and being a child of the test runner is not among them. The delivered precondition is that the process which already owns the foreground calls `LockSetForegroundWindow(LSFW_LOCK)`, and the engine is asked to focus a *different* window.
+
+One further condition was needed and is the reason this took several attempts. A foreground lock blocks a foreground request but does not remove the requester's eligibility to make one, and a process that injected the most recent input is eligible on that basis. The engine injects input throughout the suite, so a lock alone was not enough: the engine could still take the foreground, the holder was deactivated, and losing the foreground releases the lock. The fixture therefore sends a zero-distance relative mouse movement of its own immediately before locking, making itself rather than the engine the most recent input receiver. Waiting does not clear this, and a 20-second wait loop was tried and removed. This has to be the fixture that sends it: input from the test runner would make the runner eligible and invalidate the test's own `SetForegroundWindow` precheck.
+
+**Implemented but not verified on this machine,** recorded rather than claimed:
+
+- The shared injection helper's release-on-partial-failure path. Provoking a genuine partial `SendInput` failure requires a desktop that is tearing down or refusing input, which cannot be done reliably without destabilising the session the suite itself runs in. This matches the testing decision above to record it as untested.
+- User story 23, refusal when the session has no interactive desktop. `require_interactive_desktop` is in the shared guard and is composed by every action, but locking the screen to exercise it was not attempted, so no test covers the `inaccessible_desktop` code path.
+- User story 30, the same vocabulary on a window with no useful accessibility data. The action contract takes targets in observed-frame pixels and does not depend on UI Automation, so this holds by construction, but every phase-7 test derives its target coordinates from the accessibility tree. The claim is structural, not demonstrated.
+
+**Scope held as written.** The model-facing session still has its single-click decision contract. Desktop and multi-monitor overview capture, drags leaving the attached window, held state across calls, and clipboard access remain out of scope and unchanged.
+
 ## Further Notes
 
-This is the direct continuation of the previous specification, which deliberately excluded typing, key chords, scrolling, dragging, and application switching from its first slice so that the smallest image-to-action loop could be proven first. That loop is now demonstrated and recorded. The action vocabulary is the remaining gap between it and a general desktop agent.
+This is the direct continuation of the previous specification, which deliberately excluded typing, key chords, scrolling, dragging, and application switching from its first slice so that the smallest image-to-action loop could be proven first. That loop is now demonstrated and recorded. The action vocabulary was the remaining gap between it and a general desktop agent, and is now closed.
 
 The product roadmap treats reliable interaction as its second delivery milestone and lists typed text, chords, scrolling, movement, drag, right and double click, discovery, and explicit focus and switching as its contents. Right-click and double-click are included here as a small extension of the existing click rather than as separate actions, because they need no new guard and no new client surface; if scope must be cut, they are the first thing to drop.
 
