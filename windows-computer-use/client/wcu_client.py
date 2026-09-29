@@ -217,6 +217,10 @@ class WcuClient:
         res = self.request("list_windows")
         return res.get("windows", [])
 
+    def list_monitors(self) -> List[Dict[str, Any]]:
+        res = self.request("list_monitors")
+        return res.get("monitors", [])
+
     def attach(self, hwnd: str, pid: int, process_create_time_utc: str = "unknown") -> Dict[str, Any]:
         return self.request("attach", {
             "hwnd": str(hwnd),
@@ -224,14 +228,86 @@ class WcuClient:
             "process_create_time_utc": process_create_time_utc,
         })
 
+    def attach_monitor(
+        self,
+        monitor_index: Optional[int] = None,
+        hmonitor: Optional[str] = None,
+        device_name: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        args: Dict[str, Any] = {}
+        if monitor_index is not None:
+            args["monitor_index"] = monitor_index
+        if hmonitor is not None:
+            args["hmonitor"] = str(hmonitor)
+        if device_name is not None:
+            args["device_name"] = str(device_name)
+        return self.request("attach_monitor", args)
+
+    def observe_monitor(
+        self,
+        monitor_index: Optional[int] = None,
+        hmonitor: Optional[str] = None,
+        device_name: Optional[str] = None,
+        after_frame_id: int = 0,
+        timeout_ms: int = 2000,
+    ) -> Tuple[Dict[str, Any], bytes]:
+        with self._lock:
+            args: Dict[str, Any] = {
+                "after_frame_id": after_frame_id,
+                "timeout_ms": timeout_ms,
+            }
+            if monitor_index is not None:
+                args["monitor_index"] = monitor_index
+            if hmonitor is not None:
+                args["hmonitor"] = str(hmonitor)
+            if device_name is not None:
+                args["device_name"] = str(device_name)
+            meta, payload = self._raw_request(
+                "observe_monitor",
+                args,
+                timeout_sec=(timeout_ms / 1000.0) + 3.0,
+            )
+            return meta, payload
+
+    def focus_window(self, hwnd: str | int, attach: bool = False) -> Dict[str, Any]:
+        result = self.request("focus_window", {"hwnd": str(hwnd)})
+        if attach:
+            windows = self.list_windows()
+            matching = [w for w in windows if str(w.get("hwnd")) == str(hwnd)]
+            if matching:
+                target = matching[0]
+                self.attach(
+                    target["hwnd"],
+                    target["pid"],
+                    target["process_create_time_utc"],
+                )
+        return result
+
     def detach(self) -> Dict[str, Any]:
         return self.request("detach")
 
-    def observe(self, after_frame_id: int = 0, timeout_ms: int = 2000) -> Tuple[Dict[str, Any], bytes]:
+    def observe(
+        self,
+        after_frame_id: int = 0,
+        timeout_ms: int = 2000,
+        monitor_index: Optional[int] = None,
+        hmonitor: Optional[Union[str, int]] = None,
+        device_name: Optional[str] = None,
+    ) -> Tuple[Dict[str, Any], bytes]:
         with self._lock:
+            args: Dict[str, Any] = {
+                "after_frame_id": after_frame_id,
+                "timeout_ms": timeout_ms,
+            }
+            if monitor_index is not None:
+                args["monitor_index"] = monitor_index
+            if hmonitor is not None:
+                args["hmonitor"] = str(hmonitor)
+            if device_name is not None:
+                args["device_name"] = str(device_name)
             meta, payload = self._raw_request(
                 "observe",
-                {"after_frame_id": after_frame_id, "timeout_ms": timeout_ms},
+                args,
                 timeout_sec=(timeout_ms / 1000.0) + 3.0,
             )
             return meta, payload
@@ -267,6 +343,7 @@ class WcuClient:
         observation_id: int,
         target_bbox_frame_px: List[int],
         max_age_ms: int = 500,
+        dry_run: bool = False,
         timeout_sec: float = 5.0,
     ) -> Dict[str, Any]:
         return self.request(
@@ -275,6 +352,7 @@ class WcuClient:
                 "observation_id": observation_id,
                 "target_bbox_frame_px": target_bbox_frame_px,
                 "max_age_ms": max_age_ms,
+                "dry_run": dry_run,
             },
             timeout_sec=timeout_sec,
         )

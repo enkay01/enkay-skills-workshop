@@ -13,6 +13,7 @@ use windows::Graphics::Capture::{
 use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
 use windows::Graphics::DirectX::DirectXPixelFormat;
 use windows::Win32::Foundation::HWND;
+use windows::Win32::Graphics::Gdi::HMONITOR;
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0};
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
@@ -42,13 +43,36 @@ pub struct FrameSnapshot {
     pub data: Arc<Vec<u8>>,
 }
 
-pub struct CaptureTarget {
-    pub hwnd: HWND,
-    pub hwnd_val: usize,
-    pub pid: u32,
-    pub create_time: String,
-    pub geometry_epoch: Arc<AtomicU64>,
-    pub foreground_epoch: Arc<AtomicU64>,
+#[derive(Clone)]
+pub enum CaptureTarget {
+    Window {
+        hwnd: HWND,
+        hwnd_val: usize,
+        pid: u32,
+        create_time: String,
+        geometry_epoch: Arc<AtomicU64>,
+        foreground_epoch: Arc<AtomicU64>,
+    },
+    #[allow(dead_code)]
+    Monitor {
+        hmonitor: HMONITOR,
+        hmonitor_val: usize,
+        info: win_utils::MonitorInfo,
+        epoch: Arc<AtomicU64>,
+    },
+}
+
+impl CaptureTarget {
+    pub fn bump_geometry_epoch(&self) {
+        match self {
+            CaptureTarget::Window { geometry_epoch, .. } => {
+                geometry_epoch.fetch_add(1, Ordering::SeqCst);
+            }
+            CaptureTarget::Monitor { epoch, .. } => {
+                epoch.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
 }
 
 pub enum CaptureCmd {
@@ -59,6 +83,10 @@ pub enum CaptureCmd {
         geometry_epoch: Arc<AtomicU64>,
         foreground_epoch: Arc<AtomicU64>,
         reply: Sender<std::result::Result<(), ProtocolError>>,
+    },
+    StartMonitor {
+        hmonitor_val: usize,
+        reply: Sender<std::result::Result<win_utils::MonitorInfo, ProtocolError>>,
     },
     Stop {
         reply: Sender<()>,
@@ -105,6 +133,23 @@ impl CaptureWorkerHandle {
                 create_time,
                 geometry_epoch,
                 foreground_epoch,
+                reply: reply_tx,
+            })
+            .map_err(|e| ProtocolError::new("capture_failed", format!("Worker disconnected: {}", e)))?;
+
+        reply_rx
+            .recv()
+            .map_err(|e| ProtocolError::new("capture_failed", format!("Worker reply error: {}", e)))?
+    }
+
+    pub fn start_monitor_capture(
+        &self,
+        hmonitor_val: usize,
+    ) -> std::result::Result<win_utils::MonitorInfo, ProtocolError> {
+        let (reply_tx, reply_rx) = channel();
+        self.sender
+            .send(CaptureCmd::StartMonitor {
+                hmonitor_val,
                 reply: reply_tx,
             })
             .map_err(|e| ProtocolError::new("capture_failed", format!("Worker disconnected: {}", e)))?;
@@ -309,7 +354,7 @@ fn capture_worker_loop(receiver: Receiver<CaptureCmd>) {
                 }
 
                 active = Some(ActiveSession {
-                    target: CaptureTarget {
+                    target: CaptureTarget::Window {
                         hwnd,
                         hwnd_val,
                         pid,
@@ -328,6 +373,132 @@ fn capture_worker_loop(receiver: Receiver<CaptureCmd>) {
                 });
 
                 let _ = reply.send(Ok(()));
+            }
+            Ok(CaptureCmd::StartMonitor {
+                hmonitor_val,
+                reply,
+            }) => {
+                if let Some(old) = active.take() {
+                    let _ = old.session.Close();
+                    let _ = old.frame_pool.Close();
+                }
+                latest_frame = None;
+
+                if let Err(msg) = win_utils::check_interactive_desktop() {
+                    let _ = reply.send(Err(ProtocolError::new("desktop_locked", msg)));
+                    continue;
+                }
+
+                let monitors = win_utils::list_monitors();
+                let mon = match monitors.into_iter().find(|m| m.hmonitor == hmonitor_val.to_string()) {
+                    Some(m) => m,
+                    None => {
+                        let _ = reply.send(Err(ProtocolError::new(
+                            "monitor_not_found",
+                            format!("Monitor handle {} not found", hmonitor_val),
+                        )));
+                        continue;
+                    }
+                };
+
+                let hmonitor = HMONITOR(hmonitor_val as *mut _);
+                let item_res = unsafe {
+                    let interop = factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>();
+                    match interop {
+                        Ok(factory) => factory.CreateForMonitor(hmonitor),
+                        Err(e) => Err(e),
+                    }
+                };
+
+                let item: GraphicsCaptureItem = match item_res {
+                    Ok(it) => it,
+                    Err(e) => {
+                        let _ = reply.send(Err(ProtocolError::new(
+                            "capture_failed",
+                            format!("Failed to create GraphicsCaptureItem for monitor: {}", e.message()),
+                        )));
+                        continue;
+                    }
+                };
+
+                let mut item_size = match item.Size() {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let _ = reply.send(Err(ProtocolError::new(
+                            "capture_failed",
+                            format!("Failed to get capture item size: {}", e.message()),
+                        )));
+                        continue;
+                    }
+                };
+
+                if item_size.Width <= 0 || item_size.Height <= 0 {
+                    item_size.Width = mon.bounds.w.max(1);
+                    item_size.Height = mon.bounds.h.max(1);
+                }
+
+                let frame_pool = match Direct3D11CaptureFramePool::CreateFreeThreaded(
+                    &winrt_device,
+                    DirectXPixelFormat::B8G8R8A8UIntNormalized,
+                    2,
+                    item_size,
+                ) {
+                    Ok(pool) => pool,
+                    Err(e) => {
+                        let _ = reply.send(Err(ProtocolError::new(
+                            "capture_failed",
+                            format!("Failed to create frame pool for monitor: {}", e.message()),
+                        )));
+                        continue;
+                    }
+                };
+
+                let session = match frame_pool.CreateCaptureSession(&item) {
+                    Ok(sess) => sess,
+                    Err(e) => {
+                        let _ = reply.send(Err(ProtocolError::new(
+                            "capture_failed",
+                            format!("Failed to create capture session: {}", e.message()),
+                        )));
+                        continue;
+                    }
+                };
+
+                let arrived_flag = Arc::new(AtomicBool::new(false));
+                let arrived_clone = arrived_flag.clone();
+                let _ = frame_pool.FrameArrived(&TypedEventHandler::new(move |_sender, _args| {
+                    arrived_clone.store(true, Ordering::SeqCst);
+                    Ok(())
+                }));
+
+                let _ = session.SetIsCursorCaptureEnabled(false);
+                if let Err(e) = session.StartCapture() {
+                    let _ = reply.send(Err(ProtocolError::new(
+                        "capture_failed",
+                        format!("Failed to start monitor capture: {}", e.message()),
+                    )));
+                    continue;
+                }
+
+                let last_bounds = mon.bounds.clone();
+                active = Some(ActiveSession {
+                    target: CaptureTarget::Monitor {
+                        hmonitor,
+                        hmonitor_val,
+                        info: mon.clone(),
+                        epoch: Arc::new(AtomicU64::new(1)),
+                    },
+                    _item: item,
+                    frame_pool,
+                    session,
+                    frame_arrived_flag: arrived_flag,
+                    staging_texture: None,
+                    staging_width: 0,
+                    staging_height: 0,
+                    last_bounds,
+                });
+
+                let _ = reply.send(Ok(mon));
             }
             Ok(CaptureCmd::Stop { reply }) => {
                 if let Some(old) = active.take() {
@@ -348,9 +519,11 @@ fn capture_worker_loop(receiver: Receiver<CaptureCmd>) {
                 }
 
                 if let Some(ref sess) = active {
-                    if unsafe { !IsWindow(sess.target.hwnd).as_bool() } {
-                        let _ = reply.send(Err(ProtocolError::new("window_gone", "Target window closed")));
-                        continue;
+                    if let CaptureTarget::Window { hwnd, .. } = &sess.target {
+                        if unsafe { !IsWindow(*hwnd).as_bool() } {
+                            let _ = reply.send(Err(ProtocolError::new("window_gone", "Target window closed")));
+                            continue;
+                        }
                     }
                 }
 
@@ -369,9 +542,10 @@ fn capture_worker_loop(receiver: Receiver<CaptureCmd>) {
                     while Instant::now() < deadline {
                         // Check if window is still alive
                         if let Some(ref sess) = active {
-                            let is_alive = unsafe { IsWindow(sess.target.hwnd).as_bool() };
-                            if !is_alive {
-                                break;
+                            if let CaptureTarget::Window { hwnd, .. } = &sess.target {
+                                if unsafe { !IsWindow(*hwnd).as_bool() } {
+                                    break;
+                                }
                             }
                         }
 
@@ -403,47 +577,76 @@ fn capture_worker_loop(receiver: Receiver<CaptureCmd>) {
                     observation_counter += 1;
                     let sess = active.as_ref().unwrap();
 
-                    // Check bounds & epochs
-                    let current_bounds = win_utils::get_window_extended_frame_bounds(sess.target.hwnd)
-                        .unwrap_or(sess.last_bounds.clone());
+                    let metadata = match &sess.target {
+                        CaptureTarget::Window { hwnd, hwnd_val, pid, create_time, geometry_epoch, foreground_epoch } => {
+                            let current_bounds = win_utils::get_window_extended_frame_bounds(*hwnd)
+                                .unwrap_or(sess.last_bounds.clone());
+                            let dpi = unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(*hwnd) };
 
-                    let dpi = unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(sess.target.hwnd) };
-
-                    let metadata = json!({
-                        "observation_id": observation_counter,
-                        "frame_id": snapshot.frame_id,
-                        "window_identity": {
-                            "hwnd": sess.target.hwnd_val.to_string(),
-                            "pid": sess.target.pid,
-                            "process_create_time_utc": sess.target.create_time,
-                        },
-                        "geometry_epoch": sess.target.geometry_epoch.load(Ordering::SeqCst),
-                        "foreground_epoch": sess.target.foreground_epoch.load(Ordering::SeqCst),
-                        "width": snapshot.width,
-                        "height": snapshot.height,
-                        "stride_bytes": snapshot.stride_bytes,
-                        "pixel_format": "BGRA8",
-                        "content_timestamp_ns": snapshot.content_timestamp_ns,
-                        "received_timestamp_ns": snapshot.received_timestamp_ns,
-                        "published_timestamp_ns": clock_start.elapsed().as_nanos() as u64,
-                        "capture_bounds_physical_px": {
-                            "x": current_bounds.x,
-                            "y": current_bounds.y,
-                            "w": current_bounds.w,
-                            "h": current_bounds.h,
-                        },
-                        "dpi": dpi,
-                        "payload_len": snapshot.data.len(),
-                    });
+                            json!({
+                                "target_type": "window",
+                                "observation_id": observation_counter,
+                                "frame_id": snapshot.frame_id,
+                                "window_identity": {
+                                    "hwnd": hwnd_val.to_string(),
+                                    "pid": *pid,
+                                    "process_create_time_utc": create_time,
+                                },
+                                "geometry_epoch": geometry_epoch.load(Ordering::SeqCst),
+                                "foreground_epoch": foreground_epoch.load(Ordering::SeqCst),
+                                "width": snapshot.width,
+                                "height": snapshot.height,
+                                "stride_bytes": snapshot.stride_bytes,
+                                "pixel_format": "BGRA8",
+                                "content_timestamp_ns": snapshot.content_timestamp_ns,
+                                "received_timestamp_ns": snapshot.received_timestamp_ns,
+                                "published_timestamp_ns": clock_start.elapsed().as_nanos() as u64,
+                                "capture_bounds_physical_px": {
+                                    "x": current_bounds.x,
+                                    "y": current_bounds.y,
+                                    "w": current_bounds.w,
+                                    "h": current_bounds.h,
+                                },
+                                "dpi": dpi,
+                                "payload_len": snapshot.data.len(),
+                            })
+                        }
+                        CaptureTarget::Monitor { info, epoch, .. } => {
+                            json!({
+                                "target_type": "monitor",
+                                "observation_id": observation_counter,
+                                "frame_id": snapshot.frame_id,
+                                "monitor_info": info,
+                                "geometry_epoch": epoch.load(Ordering::SeqCst),
+                                "foreground_epoch": 1,
+                                "width": snapshot.width,
+                                "height": snapshot.height,
+                                "stride_bytes": snapshot.stride_bytes,
+                                "pixel_format": "BGRA8",
+                                "content_timestamp_ns": snapshot.content_timestamp_ns,
+                                "received_timestamp_ns": snapshot.received_timestamp_ns,
+                                "published_timestamp_ns": clock_start.elapsed().as_nanos() as u64,
+                                "capture_bounds_physical_px": {
+                                    "x": info.bounds.x,
+                                    "y": info.bounds.y,
+                                    "w": info.bounds.w,
+                                    "h": info.bounds.h,
+                                },
+                                "dpi": info.dpi,
+                                "payload_len": snapshot.data.len(),
+                            })
+                        }
+                    };
 
                     let payload = (*snapshot.data).clone();
                     let _ = reply.send(Ok((metadata, payload)));
                 } else {
                     if let Some(ref sess) = active {
-                        let is_alive = unsafe { IsWindow(sess.target.hwnd).as_bool() };
-                        if !is_alive {
-                            let _ = reply.send(Err(ProtocolError::new("window_gone", "Target window closed")));
-                            continue;
+                        if let CaptureTarget::Window { hwnd, .. } = &sess.target {
+                            if unsafe { !IsWindow(*hwnd).as_bool() } {
+                                let _ = reply.send(Err(ProtocolError::new("window_gone", "Target window closed")));
+                                continue;
+                            }
                         }
                     }
                     let _ = reply.send(Err(ProtocolError::new("no_fresh_frame", "No fresh frame received within timeout")));
@@ -460,10 +663,12 @@ fn capture_worker_loop(receiver: Receiver<CaptureCmd>) {
                 // Background drain of frames to keep frame pool healthy and track bounds
                 if let Some(ref mut sess) = active {
                     // Check if bounds changed
-                    if let Ok(b) = win_utils::get_window_extended_frame_bounds(sess.target.hwnd) {
-                        if b != sess.last_bounds {
-                            sess.last_bounds = b;
-                            sess.target.geometry_epoch.fetch_add(1, Ordering::SeqCst);
+                    if let CaptureTarget::Window { hwnd, geometry_epoch, .. } = &sess.target {
+                        if let Ok(b) = win_utils::get_window_extended_frame_bounds(*hwnd) {
+                            if b != sess.last_bounds {
+                                sess.last_bounds = b;
+                                geometry_epoch.fetch_add(1, Ordering::SeqCst);
+                            }
                         }
                     }
 
@@ -548,7 +753,7 @@ fn readback_frame(
             2,
             content_size,
         );
-        sess.target.geometry_epoch.fetch_add(1, Ordering::SeqCst);
+        sess.target.bump_geometry_epoch();
     }
 
     let surface = frame.Surface()?;

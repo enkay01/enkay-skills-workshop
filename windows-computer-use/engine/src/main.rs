@@ -95,6 +95,33 @@ fn run_doctor() -> serde_json::Value {
     })
 }
 
+fn find_monitor_target(args: &serde_json::Value, monitors: &[win_utils::MonitorInfo]) -> Option<win_utils::MonitorInfo> {
+    if let Some(idx) = args.get("monitor_index").and_then(|v| v.as_u64()) {
+        return monitors.iter().find(|m| m.index == idx as u32).cloned();
+    }
+    if let Some(hmon_str) = args.get("hmonitor").and_then(|v| v.as_str()) {
+        return monitors.iter().find(|m| m.hmonitor == hmon_str).cloned();
+    }
+    if let Some(dev) = args.get("device_name").and_then(|v| v.as_str()) {
+        return monitors.iter().find(|m| m.device_name.eq_ignore_ascii_case(dev)).cloned();
+    }
+    monitors.iter().find(|m| m.is_primary).cloned().or_else(|| monitors.first().cloned())
+}
+
+fn resolve_monitor_target(
+    args: &serde_json::Value,
+    monitors: &[win_utils::MonitorInfo],
+) -> Result<(win_utils::MonitorInfo, usize), ProtocolError> {
+    if monitors.is_empty() {
+        return Err(ProtocolError::new("no_monitors", "No display monitors detected"));
+    }
+    let target = find_monitor_target(args, monitors)
+        .ok_or_else(|| ProtocolError::new("monitor_not_found", "Specified monitor was not found"))?;
+    let hmon_num: usize = target.hmonitor.parse()
+        .map_err(|_| ProtocolError::new("invalid_monitor_handle", "Failed to parse monitor handle"))?;
+    Ok((target, hmon_num))
+}
+
 fn main() {
     let _ = win_utils::attach_thread_to_input_desktop();
     unsafe {
@@ -109,6 +136,7 @@ fn main() {
 
     let running = Arc::new(AtomicBool::new(true));
     let mut attached: Option<AttachedTarget> = None;
+    let mut attached_monitor: Option<win_utils::MonitorInfo> = None;
     let mut last_observation: Option<input::LastObservation> = None;
     let capture_worker = capture::CaptureWorkerHandle::new();
     let uia_worker = uia::UiaWorkerHandle::new();
@@ -149,6 +177,10 @@ fn main() {
             "list_windows" => {
                 let windows = win_utils::list_windows();
                 resp.result = json!({ "windows": windows });
+            }
+            "list_monitors" => {
+                let monitors = win_utils::list_monitors();
+                resp.result = json!({ "monitors": monitors });
             }
             "attach" => {
                 let hwnd_str = match req.args.get("hwnd").and_then(|v| v.as_str()) {
@@ -197,6 +229,7 @@ fn main() {
                                             geometry_epoch,
                                             foreground_epoch,
                                         });
+                                        attached_monitor = None;
                                         resp.result = json!({
                                             "status": "attached",
                                             "hwnd": hwnd_str,
@@ -223,15 +256,137 @@ fn main() {
                     }
                 }
             }
+            "attach_monitor" => {
+                let monitors = win_utils::list_monitors();
+                let (_target_mon, hmon_num) = match resolve_monitor_target(&req.args, &monitors) {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        resp.ok = false;
+                        resp.error = Some(e);
+                        let _ = write_response(&mut writer, &resp, &[]);
+                        continue;
+                    }
+                };
+
+                match capture_worker.start_monitor_capture(hmon_num) {
+                    Ok(mon_info) => {
+                        attached = None;
+                        attached_monitor = Some(mon_info.clone());
+                        resp.result = json!({
+                            "status": "attached",
+                            "target_type": "monitor",
+                            "monitor_info": mon_info,
+                        });
+                    }
+                    Err(e) => {
+                        resp.ok = false;
+                        resp.error = Some(e);
+                    }
+                }
+            }
+            "observe_monitor" => {
+                let monitors = win_utils::list_monitors();
+                let (target_mon, hmon_num) = match resolve_monitor_target(&req.args, &monitors) {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        resp.ok = false;
+                        resp.error = Some(e);
+                        let _ = write_response(&mut writer, &resp, &[]);
+                        continue;
+                    }
+                };
+
+                let need_start = match &attached_monitor {
+                    Some(curr) => curr.hmonitor != target_mon.hmonitor,
+                    None => true,
+                } || attached.is_some();
+
+                if need_start {
+                    if let Err(e) = capture_worker.start_monitor_capture(hmon_num) {
+                        resp.ok = false;
+                        resp.error = Some(e);
+                        let _ = write_response(&mut writer, &resp, &[]);
+                        continue;
+                    }
+                    attached = None;
+                    attached_monitor = Some(target_mon.clone());
+                }
+
+                let after_frame_id = req.args.get("after_frame_id").and_then(|v| v.as_u64()).unwrap_or(0);
+                let timeout_ms = req.args.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(2000);
+
+                match capture_worker.observe(after_frame_id, timeout_ms) {
+                    Ok((meta, payload)) => {
+                        let obs_record = input::LastObservation {
+                            observation_id: meta["observation_id"].as_u64().unwrap_or(0),
+                            frame_id: meta["frame_id"].as_u64().unwrap_or(0),
+                            target_type: meta["target_type"].as_str().unwrap_or("monitor").to_string(),
+                            published_instant: std::time::Instant::now(),
+                            geometry_epoch: meta["geometry_epoch"].as_u64().unwrap_or(0),
+                            foreground_epoch: meta["foreground_epoch"].as_u64().unwrap_or(0),
+                            width: meta["width"].as_u64().unwrap_or(0) as u32,
+                            height: meta["height"].as_u64().unwrap_or(0) as u32,
+                            bounds_x: meta["capture_bounds_physical_px"]["x"].as_i64().unwrap_or(0) as i32,
+                            bounds_y: meta["capture_bounds_physical_px"]["y"].as_i64().unwrap_or(0) as i32,
+                            bounds_w: meta["capture_bounds_physical_px"]["w"].as_i64().unwrap_or(0) as i32,
+                            bounds_h: meta["capture_bounds_physical_px"]["h"].as_i64().unwrap_or(0) as i32,
+                        };
+                        last_observation = Some(obs_record);
+
+                        resp.payload_len = payload.len() as u32;
+                        resp.result = meta;
+                        out_payload = payload;
+                    }
+                    Err(e) => {
+                        resp.ok = false;
+                        resp.error = Some(e);
+                    }
+                }
+            }
             "detach" => {
                 capture_worker.stop_capture();
                 uia_worker.clear_tokens();
                 attached = None;
+                attached_monitor = None;
                 last_observation = None;
                 resp.result = json!({ "status": "detached" });
             }
             "observe" => {
-                if attached.is_none() {
+                let is_monitor_req = req.args.get("target").and_then(|v| v.as_str()) == Some("monitor")
+                    || req.args.get("monitor_index").is_some()
+                    || req.args.get("hmonitor").is_some()
+                    || req.args.get("device_name").is_some();
+
+                if is_monitor_req {
+                    let monitors = win_utils::list_monitors();
+                    let (target_mon, hmon_num) = match resolve_monitor_target(&req.args, &monitors) {
+                        Ok(pair) => pair,
+                        Err(e) => {
+                            resp.ok = false;
+                            resp.error = Some(e);
+                            let _ = write_response(&mut writer, &resp, &[]);
+                            continue;
+                        }
+                    };
+
+                    let need_start = match &attached_monitor {
+                        Some(curr) => curr.hmonitor != target_mon.hmonitor,
+                        None => true,
+                    } || attached.is_some();
+
+                    if need_start {
+                        if let Err(e) = capture_worker.start_monitor_capture(hmon_num) {
+                            resp.ok = false;
+                            resp.error = Some(e);
+                            let _ = write_response(&mut writer, &resp, &[]);
+                            continue;
+                        }
+                        attached = None;
+                        attached_monitor = Some(target_mon.clone());
+                    }
+                }
+
+                if attached.is_none() && attached_monitor.is_none() {
                     resp.ok = false;
                     resp.error = Some(ProtocolError::new("invalid_request", "No capture target attached"));
                 } else {
@@ -243,6 +398,7 @@ fn main() {
                             let obs_record = input::LastObservation {
                                 observation_id: meta["observation_id"].as_u64().unwrap_or(0),
                                 frame_id: meta["frame_id"].as_u64().unwrap_or(0),
+                                target_type: meta["target_type"].as_str().unwrap_or("window").to_string(),
                                 published_instant: std::time::Instant::now(),
                                 geometry_epoch: meta["geometry_epoch"].as_u64().unwrap_or(0),
                                 foreground_epoch: meta["foreground_epoch"].as_u64().unwrap_or(0),
@@ -327,21 +483,34 @@ fn main() {
                 }
             }
             "click" => {
-                if attached.is_none() {
+                let identity = attached.as_ref().map(|att| input::AttachedIdentity {
+                    hwnd: att.hwnd.clone(),
+                    hwnd_num: att.hwnd_num,
+                    pid: att.pid,
+                    create_time: att.create_time.clone(),
+                    geometry_epoch: att.geometry_epoch.clone(),
+                    foreground_epoch: att.foreground_epoch.clone(),
+                });
+
+                let is_monitor_obs = last_observation
+                    .as_ref()
+                    .map(|o| o.target_type == "monitor")
+                    .unwrap_or(false);
+
+                if identity.is_none() && !is_monitor_obs {
                     resp.ok = false;
                     resp.error = Some(ProtocolError::new("invalid_request", "No target attached"));
                 } else {
-                    let att = attached.as_ref().unwrap();
-                    let identity = input::AttachedIdentity {
-                        hwnd: att.hwnd.clone(),
-                        hwnd_num: att.hwnd_num,
-                        pid: att.pid,
-                        create_time: att.create_time.clone(),
-                        geometry_epoch: att.geometry_epoch.clone(),
-                        foreground_epoch: att.foreground_epoch.clone(),
+                    let click_args: input::ClickArgs = match serde_json::from_value(req.args.clone()) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            resp.ok = false;
+                            resp.error = Some(ProtocolError::new("invalid_request", format!("Invalid click args: {e}")));
+                            let _ = write_response(&mut writer, &resp, &[]);
+                            continue;
+                        }
                     };
-
-                    match input::execute_guarded_click(&identity, last_observation.as_ref(), &req.args) {
+                    match input::execute_guarded_click(identity.as_ref(), last_observation.as_ref(), click_args) {
                         Ok(res) => {
                             resp.result = res;
                         }
@@ -349,6 +518,35 @@ fn main() {
                             resp.ok = false;
                             resp.error = Some(e);
                         }
+                    }
+                }
+            }
+            "focus_window" => {
+                let hwnd_str = match req.args.get("hwnd").and_then(|v| v.as_str()) {
+                    Some(h) => h,
+                    None => {
+                        resp.ok = false;
+                        resp.error = Some(ProtocolError::new("invalid_request", "Missing required string 'hwnd'"));
+                        let _ = write_response(&mut writer, &resp, &[]);
+                        continue;
+                    }
+                };
+                let hwnd_num: usize = match hwnd_str.parse() {
+                    Ok(n) => n,
+                    Err(_) => {
+                        resp.ok = false;
+                        resp.error = Some(ProtocolError::new("invalid_request", "Invalid decimal hwnd"));
+                        let _ = write_response(&mut writer, &resp, &[]);
+                        continue;
+                    }
+                };
+                match win_utils::focus_window(hwnd_num) {
+                    Ok(()) => {
+                        resp.result = json!({ "status": "focused", "hwnd": hwnd_str });
+                    }
+                    Err(e) => {
+                        resp.ok = false;
+                        resp.error = Some(ProtocolError::new("focus_failed", e));
                     }
                 }
             }

@@ -12,6 +12,7 @@ from typing import Any
 import cv2
 import numpy as np
 
+from transforms import CoordinateTransform
 from vision_model import ModelError, VisionModel
 from wcu_client import WcuClient, WcuError
 
@@ -148,10 +149,79 @@ def run_session(
     return {"status": "stale_target", "decisions": decisions}
 
 
+def run_overview_session(
+    client: Any,
+    model: VisionModel,
+    task: str,
+    *,
+    monitor_index: int | None = None,
+    max_dimensions: tuple[int, int] | None = (1920, 1080),
+    execute: bool = False,
+    max_decisions: int = 2,
+    max_duration_sec: float = 120.0,
+) -> dict[str, Any]:
+    if max_decisions < 1 or max_duration_sec <= 0:
+        raise ValueError("Decision and duration limits must be positive")
+
+    meta, payload = client.observe_monitor(monitor_index=monitor_index)
+    frame = decode_frame(meta, payload)
+
+    bounds = meta.get("capture_bounds_physical_px", {})
+    origin = (bounds.get("x", 0), bounds.get("y", 0))
+
+    if max_dimensions and (frame.width > max_dimensions[0] or frame.height > max_dimensions[1]):
+        transform = CoordinateTransform.from_fit(
+            original_dimensions=(frame.width, frame.height),
+            max_dimensions=max_dimensions,
+            physical_origin=origin,
+        )
+        scaled_pixels = transform.apply_to_image(frame.pixels)
+        ok, encoded = cv2.imencode(".png", scaled_pixels)
+        if not ok:
+            raise SessionError("Could not encode downscaled screenshot")
+        model_png = encoded.tobytes()
+        model_w, model_h = transform.target_dimensions
+    else:
+        transform = CoordinateTransform.identity((frame.width, frame.height), origin)
+        model_png = frame.png
+        model_w, model_h = frame.width, frame.height
+
+    intent, model_box = parse_decision(
+        model.decide(task, model_png, model_w, model_h), model_w, model_h
+    )
+
+    if intent != "click" or model_box is None:
+        return {"status": intent, "decisions": 1}
+
+    frame_box = transform.model_to_frame_bbox(model_box)
+
+    try:
+        dispatch = client.click(
+            observation_id=int(meta["observation_id"]),
+            target_bbox_frame_px=frame_box,
+            dry_run=(not execute),
+        )
+    except WcuError as exc:
+        return {"status": "action_rejected", "code": exc.code, "decisions": 1}
+
+    return {
+        "status": "dry_run" if not execute else dispatch.get("status", "clicked"),
+        "model_bbox": model_box,
+        "frame_bbox": frame_box,
+        "hit_window": dispatch.get("hit_window"),
+        "screen_x": dispatch.get("screen_x"),
+        "screen_y": dispatch.get("screen_y"),
+        "decisions": 1,
+        "action_status": dispatch.get("status"),
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run one model-controlled desktop click")
     parser.add_argument("--task", required=True)
-    parser.add_argument("--window-title", required=True, help="Unique substring of a visible window title")
+    parser.add_argument("--window-title", default=None, help="Unique substring of a visible window title")
+    parser.add_argument("--overview", action="store_true", help="Capture monitor overview instead of window")
+    parser.add_argument("--monitor-index", type=int, default=None, help="Index of monitor for overview")
     parser.add_argument("--model", default=os.getenv("WCU_MODEL"))
     parser.add_argument("--endpoint", default=os.getenv("WCU_MODEL_ENDPOINT", "http://127.0.0.1:8317/v1/chat/completions"))
     parser.add_argument("--execute", action="store_true", help="Permit one guarded desktop click")
@@ -159,15 +229,26 @@ def main() -> None:
     token = os.getenv("WCU_PROXY_TOKEN", "")
     if not args.model or not token:
         parser.error("Set --model (or WCU_MODEL) and WCU_PROXY_TOKEN")
+    if not args.overview and not args.window_title:
+        parser.error("Specify either --overview or --window-title")
     model = VisionModel(args.endpoint, args.model, token)
     try:
         with WcuClient() as client:
-            matches = [w for w in client.list_windows() if args.window_title.lower() in w.get("title", "").lower()]
-            if len(matches) != 1:
-                raise SessionError(f"Expected exactly one matching window, found {len(matches)}")
-            window = matches[0]
-            client.attach(window["hwnd"], window["pid"], window["process_create_time_utc"])
-            result = run_session(client, model, args.task, execute=args.execute)
+            if args.overview:
+                result = run_overview_session(
+                    client,
+                    model,
+                    args.task,
+                    monitor_index=args.monitor_index,
+                    execute=args.execute,
+                )
+            else:
+                matches = [w for w in client.list_windows() if args.window_title.lower() in w.get("title", "").lower()]
+                if len(matches) != 1:
+                    raise SessionError(f"Expected exactly one matching window, found {len(matches)}")
+                window = matches[0]
+                client.attach(window["hwnd"], window["pid"], window["process_create_time_utc"])
+                result = run_session(client, model, args.task, execute=args.execute)
             print(json.dumps(result, sort_keys=True))
     except (WcuError, ModelError, SessionError) as exc:
         parser.exit(1, f"Session stopped: {exc}\n")

@@ -9,9 +9,15 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
+use windows::Win32::Graphics::Gdi::{
+    EnumDisplayMonitors, GetMonitorInfoW, MonitorFromWindow, HDC, HMONITOR, MONITORINFO,
+    MONITORINFOEXW, MONITOR_DEFAULTTONEAREST,
+};
+use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetClassNameW, GetForegroundWindow, GetWindowRect, GetWindowTextLengthW,
-    GetWindowTextW, GetWindowThreadProcessId, IsWindow, IsWindowVisible,
+    BringWindowToTop, EnumWindows, GetClassNameW, GetForegroundWindow, GetWindowRect,
+    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsWindow, IsWindowVisible,
+    SetForegroundWindow, ShowWindow, SW_RESTORE,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,6 +31,8 @@ pub struct WindowInfo {
     pub dpi: u32,
     pub is_foreground: bool,
     pub is_visible: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub monitor_handle: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -33,6 +41,17 @@ pub struct RectBounds {
     pub y: i32,
     pub w: i32,
     pub h: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MonitorInfo {
+    pub index: u32,
+    pub device_name: String,
+    pub hmonitor: String,
+    pub bounds: RectBounds,
+    pub dpi: u32,
+    pub scale_factor: f64,
+    pub is_primary: bool,
 }
 
 pub fn check_interactive_desktop() -> Result<String, String> {
@@ -150,6 +169,12 @@ pub fn list_windows() -> Vec<WindowInfo> {
             let dpi = unsafe { GetDpiForWindow(hwnd) };
             let fg = unsafe { GetForegroundWindow() == hwnd };
             let create_time = get_process_creation_time(pid);
+            let hmon = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+            let monitor_handle = if hmon.0.is_null() {
+                None
+            } else {
+                Some((hmon.0 as usize).to_string())
+            };
 
             list.push(WindowInfo {
                 hwnd: (hwnd.0 as usize).to_string(),
@@ -166,6 +191,7 @@ pub fn list_windows() -> Vec<WindowInfo> {
                 dpi,
                 is_foreground: fg,
                 is_visible: visible,
+                monitor_handle,
             });
         }
 
@@ -174,6 +200,82 @@ pub fn list_windows() -> Vec<WindowInfo> {
 
     unsafe {
         let _ = EnumWindows(Some(enum_proc), LPARAM(&mut list as *mut _ as isize));
+    }
+
+    list
+}
+
+pub fn list_monitors() -> Vec<MonitorInfo> {
+    let _ = attach_thread_to_input_desktop();
+    let mut list = Vec::new();
+
+    unsafe extern "system" fn monitor_enum_proc(
+        hmonitor: HMONITOR,
+        _hdc: HDC,
+        _rect: *mut RECT,
+        lparam: LPARAM,
+    ) -> BOOL {
+        let list_ptr = lparam.0 as *mut Vec<MonitorInfo>;
+        let list = unsafe { &mut *list_ptr };
+
+        let mut mi = MONITORINFOEXW::default();
+        mi.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+
+        let ok = unsafe {
+            GetMonitorInfoW(
+                hmonitor,
+                &mut mi as *mut MONITORINFOEXW as *mut MONITORINFO,
+            )
+        };
+
+        if ok.as_bool() {
+            let rect = mi.monitorInfo.rcMonitor;
+            let w = rect.right - rect.left;
+            let h = rect.bottom - rect.top;
+
+            let mut dpi_x = 96u32;
+            let mut dpi_y = 96u32;
+            let _ = unsafe {
+                GetDpiForMonitor(hmonitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y)
+            };
+            let dpi = if dpi_x > 0 { dpi_x } else { 96 };
+            let scale_factor = (dpi as f64) / 96.0;
+
+            let is_primary = (mi.monitorInfo.dwFlags & 1) != 0;
+
+            let dev_len = (0..mi.szDevice.len())
+                .position(|i| mi.szDevice[i] == 0)
+                .unwrap_or(mi.szDevice.len());
+            let device_name = String::from_utf16_lossy(&mi.szDevice[..dev_len]);
+
+            let index = list.len() as u32;
+
+            list.push(MonitorInfo {
+                index,
+                device_name,
+                hmonitor: (hmonitor.0 as usize).to_string(),
+                bounds: RectBounds {
+                    x: rect.left,
+                    y: rect.top,
+                    w,
+                    h,
+                },
+                dpi,
+                scale_factor,
+                is_primary,
+            });
+        }
+
+        BOOL(1)
+    }
+
+    unsafe {
+        let _ = EnumDisplayMonitors(
+            HDC::default(),
+            None,
+            Some(monitor_enum_proc),
+            LPARAM(&mut list as *mut _ as isize),
+        );
     }
 
     list
@@ -233,6 +335,23 @@ pub fn get_window_extended_frame_bounds(hwnd: HWND) -> Result<RectBounds, String
             } else {
                 Err("Failed to query window bounds".into())
             }
+        }
+    }
+}
+
+pub fn focus_window(hwnd_val: usize) -> Result<(), String> {
+    let hwnd = HWND(hwnd_val as *mut _);
+    unsafe {
+        if !IsWindow(hwnd).as_bool() {
+            return Err("Window handle does not exist".into());
+        }
+        let _ = ShowWindow(hwnd, SW_RESTORE);
+        let _ = BringWindowToTop(hwnd);
+        let ok = SetForegroundWindow(hwnd);
+        if ok.as_bool() || GetForegroundWindow() == hwnd {
+            Ok(())
+        } else {
+            Err("Failed to set target window as foreground".into())
         }
     }
 }

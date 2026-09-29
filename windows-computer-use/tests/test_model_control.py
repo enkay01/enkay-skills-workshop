@@ -10,25 +10,25 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "client"))
 
-from model_control import SessionError, run_session
+from model_control import SessionError, run_session, run_overview_session
 from vision_model import ModelError
 from wcu_client import WcuError
 
 
-def frame(frame_id: int, *, target_changed: bool = False) -> tuple[dict, bytes]:
-    pixels = np.full((80, 100, 4), 255, dtype=np.uint8)
+def frame(frame_id: int, *, target_changed: bool = False, width: int = 100, height: int = 80) -> tuple[dict, bytes]:
+    pixels = np.full((height, width, 4), 255, dtype=np.uint8)
     if target_changed:
         pixels[10:30, 10:30, :3] = 0
     meta = {
         "observation_id": frame_id,
         "frame_id": frame_id,
-        "width": 100,
-        "height": 80,
-        "stride_bytes": 400,
+        "width": width,
+        "height": height,
+        "stride_bytes": width * 4,
         "window_identity": {"hwnd": "1", "pid": 2, "process_create_time_utc": "x"},
         "geometry_epoch": 1,
         "foreground_epoch": 1,
-        "capture_bounds_physical_px": {"x": 0, "y": 0, "w": 100, "h": 80},
+        "capture_bounds_physical_px": {"x": 0, "y": 0, "w": width, "h": height},
     }
     return meta, pixels.tobytes()
 
@@ -37,6 +37,7 @@ class DesktopClient:
     def __init__(self, frames: list[tuple[dict, bytes]]):
         self.frames = iter(frames)
         self.clicks: list[tuple[int, list[int]]] = []
+        self.last_dry_run: bool = False
 
     def observe(self, after_frame_id: int = 0, timeout_ms: int = 2000):
         try:
@@ -47,19 +48,41 @@ class DesktopClient:
             raise WcuError("no_fresh_frame", "No new frame")
         return result
 
-    def click(self, observation_id: int, target_bbox_frame_px: list[int]):
+    def observe_monitor(self, monitor_index: int | None = None):
+        return self.observe()
+
+    def click(self, observation_id: int, target_bbox_frame_px: list[int], dry_run: bool = False):
         self.clicks.append((observation_id, target_bbox_frame_px))
-        return {"status": "clicked"}
+        self.last_dry_run = dry_run
+        return {
+            "status": "dry_run" if dry_run else "clicked",
+            "screen_x": target_bbox_frame_px[0],
+            "screen_y": target_bbox_frame_px[1],
+            "hit_window": {
+                "hwnd": "12345",
+                "root_hwnd": "12345",
+                "title": "Target App",
+                "pid": 5678,
+            },
+        }
 
 
 class Model:
-    def __init__(self, decisions: list[dict], verdict: str = "success"):
+    def __init__(
+        self,
+        decisions: list[dict],
+        verdict: str = "success",
+        expected_size: tuple[int, int] | None = (100, 80),
+    ):
         self.decisions = iter(decisions)
         self.verdict = verdict
+        self.expected_size = expected_size
         self.images_seen = 0
 
     def decide(self, task: str, png: bytes, width: int, height: int):
-        assert png.startswith(b"\x89PNG") and (width, height) == (100, 80)
+        assert png.startswith(b"\x89PNG")
+        if self.expected_size is not None:
+            assert (width, height) == self.expected_size
         self.images_seen += 1
         return next(self.decisions)
 
@@ -120,6 +143,54 @@ class ModelControlTests(unittest.TestCase):
         self.assertEqual(result["status"], "verification_unavailable")
         self.assertEqual(client.clicks, [(2, [10, 10, 20, 20])])
 
+    def test_overview_session_dry_run_with_scaling(self):
+        client = DesktopClient([frame(1, width=200, height=160)])
+        model = Model([{"intent": "click", "bbox": [10, 10, 20, 20]}], expected_size=(100, 80))
+
+        result = run_overview_session(
+            client,
+            model,
+            "Locate app icon on monitor",
+            max_dimensions=(100, 80),
+            execute=False,
+        )
+
+        self.assertEqual(result["status"], "dry_run")
+        self.assertTrue(client.last_dry_run)
+        self.assertEqual(result["model_bbox"], [10, 10, 20, 20])
+        self.assertEqual(result["frame_bbox"], [20, 20, 40, 40])
+        self.assertEqual(client.clicks, [(1, [20, 20, 40, 40])])
+        self.assertIsNotNone(result.get("hit_window"))
+        self.assertEqual(result["hit_window"]["title"], "Target App")
+
+    def test_overview_session_executed_click(self):
+        client = DesktopClient([frame(1, width=100, height=80)])
+        model = Model([{"intent": "click", "bbox": [15, 25, 10, 10]}], expected_size=(100, 80))
+
+        result = run_overview_session(
+            client,
+            model,
+            "Click taskbar button",
+            max_dimensions=(1920, 1080),
+            execute=True,
+        )
+
+        self.assertEqual(result["status"], "clicked")
+        self.assertFalse(client.last_dry_run)
+        self.assertEqual(result["model_bbox"], [15, 25, 10, 10])
+        self.assertEqual(result["frame_bbox"], [15, 25, 10, 10])
+        self.assertEqual(client.clicks, [(1, [15, 25, 10, 10])])
+
+    def test_overview_session_cannot_decide(self):
+        client = DesktopClient([frame(1, width=100, height=80)])
+        model = Model([{"intent": "cannot_decide"}], expected_size=(100, 80))
+
+        result = run_overview_session(client, model, "Find invisible window", execute=False)
+
+        self.assertEqual(result["status"], "cannot_decide")
+        self.assertEqual(client.clicks, [])
+
 
 if __name__ == "__main__":
     unittest.main()
+
