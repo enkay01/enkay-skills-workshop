@@ -39,6 +39,19 @@ partial `SendInput` failure and never retries, but that release path is
 implemented and reasoned about rather than exercised by the suite. `focus_window`
 takes a deliberate 120 ms settle before verifying.
 
+The guard also refuses with `desktop_inaccessible` when the session has no usable
+interactive desktop. That condition cannot be produced from a test on a live
+session, so the engine carries a one-way test valve: setting
+`WCU_TEST_DESKTOP_INACCESSIBLE` to any value makes the check report the session
+as inaccessible. It can only ever force a refusal, never suppress a real one, so
+it cannot be used to weaken the guard — a valve leaked into production makes every
+action fail loudly rather than letting input through. Its refusal names the
+variable, so a test artefact is never mistaken for a genuinely locked session.
+`tests/test_desktop_inaccessible_guard.py` uses it to prove all six
+input-dispatching actions refuse and dispatch nothing. The reasoning, including
+three approaches that were tried and measured to fail, is in
+[desktop-inaccessibility-guard-testing.md](specs/desktop-inaccessibility-guard-testing.md).
+
 ## First model-controlled interaction
 
 The [model-control session](client/model_control.py) now gives a configured vision model one window screenshot, accepts one validated click rectangle, checks a newer observation, sends one guarded click, and asks the model to judge a second screenshot. The controlled fixture demonstration and its limits are recorded in [model-controlled-interaction-results.md](research/model-controlled-interaction-results.md).
@@ -103,7 +116,8 @@ windows-computer-use/
 │   ├── test_phase4_recognition.py <-- RapidOCR target gating & abstention suite
 │   ├── test_phase5_guarded_click.py <-- Live guarded SendInput & negative gates
 │   ├── test_phase6_workflow.py  <-- Bounded state machine transitions
-│   └── test_phase7_desktop_actions.py <-- Typing, keys, scroll, hover, drag, focus
+│   ├── test_phase7_desktop_actions.py <-- Typing, keys, scroll, hover, drag, focus
+│   └── test_desktop_inaccessible_guard.py <-- desktop_inaccessible, every action
 └── research/
     ├── implementation-results.md <-- Full empirical measurements & benchmark data
     ├── desktop-action-expansion-results.md <-- Phase 7 verified effects & latency
@@ -165,7 +179,14 @@ python tests/test_phase6_workflow.py
 # Phase 7: Typing, key chords, scrolling, hover, drag, window switching
 python -m pytest tests/test_phase7_desktop_actions.py --timeout=300
 
-# Everything (67 tests). Needs a real interactive desktop; there is no headless path.
+# Desktop-inaccessibility guard: every action refuses when the session has no
+# usable interactive desktop
+python -m pytest tests/test_desktop_inaccessible_guard.py --timeout=300
+
+# Engine unit tests, including the desktop-verdict logic
+cd engine && cargo test
+
+# Everything (77 tests). Needs a real interactive desktop; there is no headless path.
 python -m pytest tests/ --timeout=300 -q
 ```
 

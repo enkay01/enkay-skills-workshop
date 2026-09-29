@@ -27,44 +27,11 @@ This board tracks all technical limitations, architectural constraints, security
 | **WCU-009** | [Release-on-Partial-Input-Failure Is Untested](#wcu-009-release-on-partial-input-failure-is-untested) | **Medium** | Input / Correctness | **Open (Untested)** | Phase 7 (Desktop Actions) |
 | **WCU-010** | [DPI Awareness Cannot Be Forced From The Test Runner](#wcu-010-dpi-awareness-cannot-be-forced-from-the-test-runner) | **Medium** | Test Harness / Coordinates | **Mitigated (Measure, Don't Assume)** | Phase 7 (Desktop Actions) |
 | **WCU-011** | [Cross-Window Targets Are Not Expressible](#wcu-011-cross-window-targets-are-not-expressible) | **Medium** | Scope / Architecture | **Open (By Design)** | Post-Phase 7 |
+| **WCU-012** | [The Desktop-Inaccessibility Check Cannot Be Provoked On An Interactive Session](#wcu-012-the-desktop-inaccessibility-check-cannot-be-provoked-on-an-interactive-session) | **Medium** | OS / Test Harness | **Partially Mitigated (Test Valve)** | Phase 7 (Desktop Actions) |
 
 ---
 
 ## Detailed Issue Tracking
-
-### WCU-008: Input-Derived Foreground Eligibility Defeats a Foreground Lock
-- **Severity:** High (silently invalidates any focus-refusal precondition built on `LockSetForegroundWindow`)
-- **Component:** OS / Focus Policy
-- **Status:** Mitigated on the test side; the underlying behaviour is not a defect and must not be worked around in the engine
-- **Observed In:** Phase 7 `test_27_refused_focus_names_the_window_that_holds_the_foreground`, full-suite runs only
-- **Root Cause:** `SetForegroundWindow` succeeds when the calling process injected the most recent input. That eligibility is independent of a foreground lock, which blocks the request but does not remove the eligibility. The engine injects input throughout the suite, so a `LSFW_LOCK` taken by the foreground-owning process was not enough: the engine still took the foreground, the holder was deactivated, and losing the foreground releases the lock. The fixture's own record showed the sequence directly — `lock=True`, then `lost-foreground`, then `unlock=False`.
-- **Why the engine is not at fault:** the engine's focus path is the documented one, `SetForegroundWindow` followed by verification against the real foreground. It reports `focus_refused` correctly whenever the request genuinely fails.
-- **Mitigation:** the foreground fixture sends one relative mouse movement of zero distance immediately before taking the lock, so it rather than the engine is the most recent input receiver. This must originate in the foreground-owning process; input from the test runner would make the runner eligible and invalidate the test's own precheck. Waiting does not clear the eligibility — a 20-second wait loop was tried and removed.
-- **Also ruled out during investigation, recorded so they are not retried:** an off-desktop window fails as `window_gone` before any focus attempt; `WS_EX_NOACTIVATE` does not prevent activation through `SetForegroundWindow`; and `AllowSetForegroundWindow(ASFW_ANY)` is not documented to override a lock, so the earlier conclusion that it did was based on an invalid experiment in which the locking process did not own the foreground.
-- **Reference:** [`research/desktop-action-expansion-results.md`](research/desktop-action-expansion-results.md)
-
-### WCU-009: Release-on-Partial-Input-Failure Is Untested
-- **Severity:** Medium (a stuck button or modifier would be a real user-visible fault)
-- **Component:** `engine/src/input.rs` shared injection helper
-- **Status:** Open — implemented and reasoned about, not verified
-- **Root Cause / Gap:** the helper checks how many events `SendInput` actually accepted, releases whatever is still held on a partial failure, and never retries. This is the single place input reaches the operating system, so an untested path here is untested everywhere.
-- **Why it is untested:** provoking a genuine partial failure needs a desktop that is tearing down or refusing input, which cannot be done reliably without destabilising the interactive session the suite itself runs in. The suite verifies that all events were accepted; it does not exercise the cleanup.
-- **Mitigation:** recorded as a limit rather than presented as tested. Closing this needs an isolated session or a test seam that can force a short write, neither of which exists yet.
-
-### WCU-010: DPI Awareness Cannot Be Forced From The Test Runner
-- **Severity:** Medium (coordinate mismatches present as convincing false engine bugs)
-- **Component:** Test harness coordinate handling
-- **Status:** Mitigated by measurement rather than configuration
-- **Root Cause:** Python on this machine is system-DPI-aware through a manifest, so both `SetProcessDpiAwarenessContext` and `SetThreadDpiAwarenessContext` fail silently. Raw window calls are therefore virtualised while the engine's accessibility-derived bounds are physical, and the two disagree by the scale factor (measured 0.6662 at 150% scaling). Two separate false diagnoses came from mixing the two coordinate spaces.
-- **Mitigation:** the suite measures the scale it actually gets, by comparing `GetWindowRect` against the engine's per-monitor-aware bounds, and converts explicitly. It reports the measured scale at startup. Attempting to force awareness would be misleading rather than protective, since the calls do not fail loudly.
-- **Reference:** [`tests/test_phase7_desktop_actions.py`](tests/test_phase7_desktop_actions.py), `_measure_coordinate_scale`
-
-### WCU-011: Cross-Window Targets Are Not Expressible
-- **Severity:** Medium (blocks whole task shapes, not just edge cases)
-- **Component:** Action target contract
-- **Status:** Open by design
-- **Root Cause:** a pointer target is expressed in the pixels of the observation the caller saw, and both drag endpoints must lie inside the attached window's observed frame. A drag that must leave the attached window — dropping a file onto another application, or selecting across a dialog owned by a different top-level window — is therefore not expressible.
-- **Mitigation:** none yet. This is the documented boundary of the action contract rather than a defect: a bare screen coordinate is deliberately not accepted for any pointer action, which is what keeps actions tied to the window the decision was made against. Cross-window work needs either desktop-wide observation or an explicit first-class concept of a second attachable target.
 
 ### WCU-001: DirectX & GPU Swapchain UIA Blindness (0 Elements)
 - **Severity:** Critical (Blocks semantic automation on games and 3D applications)
@@ -151,3 +118,53 @@ This board tracks all technical limitations, architectural constraints, security
   - Dispatch a focus/click event into the webview body to trigger Chromium's accessibility initialization, or
   - Fall back to WGC screenshot + coordinate injection.
 - **Reference:** [`research/winapp-ui-trial-results.md`](file:///d:/stroo/Documents/GitHub/enkay-skills-workshop/windows-computer-use/research/winapp-ui-trial-results.md) Section 3.4
+
+### WCU-008: Input-Derived Foreground Eligibility Defeats a Foreground Lock
+- **Severity:** High (silently invalidates any focus-refusal precondition built on `LockSetForegroundWindow`)
+- **Component:** OS / Focus Policy
+- **Status:** Mitigated on the test side; the underlying behaviour is not a defect and must not be worked around in the engine
+- **Observed In:** Phase 7 `test_27_refused_focus_names_the_window_that_holds_the_foreground`, full-suite runs only
+- **Root Cause:** `SetForegroundWindow` succeeds when the calling process injected the most recent input. That eligibility is independent of a foreground lock, which blocks the request but does not remove the eligibility. The engine injects input throughout the suite, so a `LSFW_LOCK` taken by the foreground-owning process was not enough: the engine still took the foreground, the holder was deactivated, and losing the foreground releases the lock. The fixture's own record showed the sequence directly — `lock=True`, then `lost-foreground`, then `unlock=False`.
+- **Why the engine is not at fault:** the engine's focus path is the documented one, `SetForegroundWindow` followed by verification against the real foreground. It reports `focus_refused` correctly whenever the request genuinely fails.
+- **Mitigation:** the foreground fixture sends one relative mouse movement of zero distance immediately before taking the lock, so it rather than the engine is the most recent input receiver. This must originate in the foreground-owning process; input from the test runner would make the runner eligible and invalidate the test's own precheck. Waiting does not clear the eligibility — a 20-second wait loop was tried and removed.
+- **Also ruled out during investigation, recorded so they are not retried:** an off-desktop window fails as `window_gone` before any focus attempt; `WS_EX_NOACTIVATE` does not prevent activation through `SetForegroundWindow`; and `AllowSetForegroundWindow(ASFW_ANY)` is not documented to override a lock, so the earlier conclusion that it did was based on an invalid experiment in which the locking process did not own the foreground.
+- **Reference:** [`research/desktop-action-expansion-results.md`](research/desktop-action-expansion-results.md)
+
+### WCU-009: Release-on-Partial-Input-Failure Is Untested
+- **Severity:** Medium (a stuck button or modifier would be a real user-visible fault)
+- **Component:** `engine/src/input.rs` shared injection helper
+- **Status:** Open — implemented and reasoned about, not verified
+- **Root Cause / Gap:** the helper checks how many events `SendInput` actually accepted, releases whatever is still held on a partial failure, and never retries. This is the single place input reaches the operating system, so an untested path here is untested everywhere.
+- **Why it is untested:** provoking a genuine partial failure needs a desktop that is tearing down or refusing input, which cannot be done reliably without destabilising the interactive session the suite itself runs in. The suite verifies that all events were accepted; it does not exercise the cleanup.
+- **Mitigation:** recorded as a limit rather than presented as tested. Closing this needs an isolated session or a test seam that can force a short write, neither of which exists yet.
+
+### WCU-010: DPI Awareness Cannot Be Forced From The Test Runner
+- **Severity:** Medium (coordinate mismatches present as convincing false engine bugs)
+- **Component:** Test harness coordinate handling
+- **Status:** Mitigated by measurement rather than configuration
+- **Root Cause:** Python on this machine is system-DPI-aware through a manifest, so both `SetProcessDpiAwarenessContext` and `SetThreadDpiAwarenessContext` fail silently. Raw window calls are therefore virtualised while the engine's accessibility-derived bounds are physical, and the two disagree by the scale factor (measured 0.6662 at 150% scaling). Two separate false diagnoses came from mixing the two coordinate spaces.
+- **Mitigation:** the suite measures the scale it actually gets, by comparing `GetWindowRect` against the engine's per-monitor-aware bounds, and converts explicitly. It reports the measured scale at startup. Attempting to force awareness would be misleading rather than protective, since the calls do not fail loudly.
+- **Reference:** [`tests/test_phase7_desktop_actions.py`](tests/test_phase7_desktop_actions.py), `_measure_coordinate_scale`
+
+### WCU-011: Cross-Window Targets Are Not Expressible
+- **Severity:** Medium (blocks whole task shapes, not just edge cases)
+- **Component:** Action target contract
+- **Status:** Open by design
+- **Root Cause:** a pointer target is expressed in the pixels of the observation the caller saw, and both drag endpoints must lie inside the attached window's observed frame. A drag that must leave the attached window — dropping a file onto another application, or selecting across a dialog owned by a different top-level window — is therefore not expressible.
+- **Mitigation:** none yet. This is the documented boundary of the action contract rather than a defect: a bare screen coordinate is deliberately not accepted for any pointer action, which is what keeps actions tied to the window the decision was made against. Cross-window work needs either desktop-wide observation or an explicit first-class concept of a second attachable target.
+
+### WCU-012: The Desktop-Inaccessibility Check Cannot Be Provoked On An Interactive Session
+- **Severity:** Medium (the guard works; the risk is in believing it was never exercised)
+- **Component:** Win32 User Subsystem / Desktop Stations, and the test harness
+- **Status:** Partially mitigated. The check was wired into six actions with no test at all; it is now covered as described below, and one branch remains unverified.
+- **Root Cause / Gap:** `require_interactive_desktop` refuses with `desktop_inaccessible` when the session has no usable interactive desktop. Before this work it had zero coverage — and the gap had been described as "not attempted", which reads as mere inconvenience. It is not. Three approaches were implemented and measured, and all three fail:
+  - **`CreateDesktop` + `SetThreadDesktop`** does not work, because `OpenInputDesktop` reports the **window station's** input desktop, not the calling thread's. A thread attached to a private desktop still reads `Default` back. The name suggests otherwise and the intuition is wrong; the handle set, the desktop landed on, and the name the guard reads are three different things.
+  - **Launching the engine on a private desktop** via `STARTUPINFO.lpDesktop` does not work, for the same reason, and the engine additionally re-attaches itself to the input desktop during startup.
+  - **`CreateWindowStation`** fails with `ERROR_ACCESS_DENIED` (err 5) under every access mask tried, because it requires `SE_CREATE_WINDOW_STATION`, which an interactive user does not hold.
+  - The only routes left are locking the session or `SwitchDesktop`, both of which destroy the desktop the suite runs in.
+- **What the check is really for:** verifying the window station's input desktop is the interactive one. That is exactly right for detecting a non-interactive deployment, and it is what the guard now documents itself as doing. It is simply not something thread-level desktop control can influence. This is the same boundary [WCU-003](#wcu-003-headless-desktop-input-failure-no_interactive_desktop) records for `winapp ui`, expressed with the engine's own error code.
+- **Resolution (Phase 7 follow-up):** the Win32 query was reduced to the facts it gathers and the decision split into a pure verdict, so the decision is tested directly against the names Windows actually uses. The live query's passing branch is tested against the real API. A one-way test valve then lets the integration suite prove all six input-dispatching actions refuse and dispatch nothing, reading the application's own state afterwards.
+- **Why the valve is acceptable:** it can only ever force the refusing verdict. No value and no code path turns a failing check into a passing one, so it cannot be used to weaken the guard. A valve leaked into production makes every action fail loudly rather than letting input through. It is honoured in release builds deliberately, because a valve restricted to debug builds would let a suite run against a release binary pass while asserting nothing.
+- **Still unverified:** the branch where the operating system refuses to hand over the input desktop at all, i.e. a genuinely locked session. That is the one case this check exists for, and it cannot be exercised without changing the state of the live session. Closing it needs an isolated session or a separate host, neither of which exists here.
+- **Also recorded:** a window focus request composes no desktop check. That is a decision, not an omission — focusing dispatches no input, so the harm this check prevents cannot arise from it, and it is pinned by a test so it reads as deliberate.
+- **Reference:** [`specs/desktop-inaccessibility-guard-testing.md`](specs/desktop-inaccessibility-guard-testing.md), [`engine/src/win_utils.rs`](engine/src/win_utils.rs), [`tests/test_desktop_inaccessible_guard.py`](tests/test_desktop_inaccessible_guard.py)
