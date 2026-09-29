@@ -31,7 +31,7 @@ A first vision-model session is now demonstrated against the native fixture: the
 1. Let the phase-5 agent finish guarded clicking. Reconcile existing phase-5/6 code and report claims before duplicating work. Preserve foreground, geometry, and observation checks.
 2. Demonstrate the smallest real model loop immediately: capture -> encode an image in memory -> model chooses a click -> dispatch -> fresh image -> model verifies the result. Use a controlled desktop fixture. OCR must be optional.
 3. Expand the generic actions for actual desktop tasks: type text, key chords, scroll, right/double click, move/hover, drag, window discovery, and explicit focus/switch. Support cross-window dialogs and menus. Keep actions tied to observation/window identity.
-4. Add desktop/monitor overview capture so the model can locate apps, taskbar, and popups outside the selected window. Define physical coordinates, crop/resize transforms, monitor identity, and observation IDs in the tool contract.
+4. [Completed - Issue #3] Desktop/monitor overview capture: monitor enumeration, Windows Graphics Capture for monitors, coordinate scaling/inversion transforms, guarded overview clicks with hit-testing, and window focusing contract implemented and tested.
 5. Run cross-application tasks, then plug in a second model provider without changing the Rust engine. Implement a host adapter such as MCP when the intended host supports it; keep the core API usable through ordinary model API calls too.
 
 ## Contracts that the model layer must resolve
