@@ -106,6 +106,22 @@ class WcuClient:
         with self._lock:
             self._stop_locked()
 
+    def kill(self) -> None:
+        """Terminate the engine process immediately, without waiting.
+
+        Used by cancellation. A pending operation holds ``self._lock`` for
+        its whole duration, so going through ``stop()`` would block until
+        that operation finished -- exactly what cancellation must avoid.
+        Terminating the process closes the pipes and unblocks the pending
+        read at once, so the in-flight operation fails fast and reports.
+        """
+        proc = self._proc
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+
     @property
     def pid(self) -> Optional[int]:
         return self._proc.pid if self._proc else None
@@ -175,6 +191,16 @@ class WcuClient:
 
                 resp_bytes = _read_exact_proc(resp_len)
                 resp_obj = json.loads(resp_bytes.decode("utf-8"))
+
+                # The engine echoes the request id. A mismatch means this
+                # response belongs to an earlier request (stale) or was
+                # misrouted; never let it satisfy the current one.
+                resp_id = resp_obj.get("id")
+                if resp_id is not None and resp_id != req_id:
+                    raise WcuError(
+                        "stale_response",
+                        f"Response id {resp_id} does not match request id {req_id}",
+                    )
 
                 resp_payload = b""
                 resp_payload_len = resp_obj.get("payload_len", 0)

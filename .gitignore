@@ -16,3 +16,4 @@ windows-computer-use/research/**/*.png
 windows-computer-use/research/*.json
 fixture_log.txt
 windows-computer-use/fixture_log.txt
+windows-computer-use/cli/wcu_cli.egg-info/
