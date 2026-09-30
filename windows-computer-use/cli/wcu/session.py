@@ -28,6 +28,7 @@ from wcu.paths import (
     session_dir,
     shots_dir,
     state_file,
+    wcu_home,
 )
 
 START_TIMEOUT_SEC = 15.0
@@ -119,8 +120,56 @@ def _server_env() -> Dict[str, str]:
     return env
 
 
+def _start_lock_path() -> Path:
+    return wcu_home() / "session.lock"
+
+
+def _acquire_start_lock() -> Optional[int]:
+    """Hold a lock file so only one `session start` runs the check-and-spawn.
+
+    Returns the fd, or None if another start already holds it.
+    """
+    wcu_home().mkdir(parents=True, exist_ok=True)
+    try:
+        fd = os.open(_start_lock_path(), os.O_CREAT | os.O_EXCL | os.O_RDWR)
+        os.write(fd, str(os.getpid()).encode("ascii"))
+        return fd
+    except FileExistsError:
+        return None
+
+
+def _release_start_lock(fd: Optional[int]) -> None:
+    if fd is None:
+        return
+    try:
+        os.close(fd)
+        os.remove(_start_lock_path())
+    except OSError:
+        pass
+
+
 def start_session(engine_path: Optional[Path] = None) -> Dict[str, Any]:
     """Start the persistent session process, or refuse a second one."""
+    lock_fd = _acquire_start_lock()
+    if lock_fd is None:
+        # Another start is in progress; report the active session if one exists.
+        state = read_state()
+        raise SessionError(
+            "session_already_active",
+            "A session is already active for this desktop",
+            {
+                "session_id": state.get("session_id") if state else None,
+                "pid": state.get("pid") if state else None,
+            },
+        )
+    try:
+        return _start_session_locked(engine_path)
+    finally:
+        _release_start_lock(lock_fd)
+
+
+def _start_session_locked(engine_path: Optional[Path]) -> Dict[str, Any]:
+    """start_session body, called with the start lock held."""
     state = read_state()
     if state and _pid_alive(int(state.get("pid", 0) or 0)):
         raise SessionError(

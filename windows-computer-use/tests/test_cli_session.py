@@ -106,14 +106,18 @@ class TestCliSession(unittest.TestCase):
         return str(windows[0]["hwnd"])
 
     def _ensure_attached(self) -> str:
-        """Attach to the fixture and bring it to the foreground.
-
-        Guarded actions require the target window to be in the foreground,
-        so the test focuses it (the fixture calls AllowSetForegroundWindow,
-        letting the engine set it foreground).
-        """
+        """Attach to the fixture window (inspect/observe need a target)."""
         hwnd = self._fixture_hwnd()
         cli_ok("attach", hwnd)
+        return hwnd
+
+    def _focus_fixture(self) -> str:
+        """Bring the fixture to the foreground for guarded actions.
+
+        The fixture calls AllowSetForegroundWindow, letting the engine set it
+        foreground. Guarded actions require the target to be in front.
+        """
+        hwnd = self._fixture_hwnd()
         cli_ok("focus", hwnd)
         return hwnd
 
@@ -132,10 +136,14 @@ class TestCliSession(unittest.TestCase):
         self._ensure_attached()
         return cli_ok("observe")["result"]
 
-    def _click_continue(self, obs: dict) -> dict:
-        """Click the fixture's Continue button using UIA bounds mapped into
-        the observation frame."""
-        self._ensure_attached()
+    def _click_continue(self) -> dict:
+        """Focus the fixture, then click its Continue button.
+
+        Uses UIA bounds mapped into the observation frame. Guarded actions
+        require the target in the foreground, so the fixture is focused first.
+        """
+        self._focus_fixture()
+        obs = self._observe()
         insp = cli_ok("inspect", "--max-elements", "60")["result"]
         btn = next(
             (
@@ -219,8 +227,7 @@ class TestCliSession(unittest.TestCase):
         cli_ok("session", "start")
         self.assertEqual(self._counter(), 0)
 
-        obs = self._observe()
-        env = self._click_continue(obs)
+        env = self._click_continue()
         self.assertTrue(env["ok"], f"click refused: {env}")
         self.assertEqual(env["status"], "ok")
         self.assertEqual(env["result"]["dispatch"]["status"], "clicked")
@@ -261,7 +268,6 @@ class TestCliSession(unittest.TestCase):
         hwnd_int = int(hwnd)
         before = self._counter()
 
-        obs = self._observe()
         rect = ctypes.wintypes.RECT()
         user32.GetWindowRect(hwnd_int, ctypes.byref(rect))
         cur_w = rect.right - rect.left
@@ -272,7 +278,7 @@ class TestCliSession(unittest.TestCase):
             user32.SetForegroundWindow(hwnd_int)
             time.sleep(0.3)
 
-            env = self._click_continue(obs)
+            env = self._click_continue()
             self.assertFalse(env["ok"], "moved-window click should be refused")
             self.assertEqual(env["status"], "refused")
             self.assertIn(env["error"]["code"], ["geometry_changed", "foreground_changed"])
@@ -288,6 +294,7 @@ class TestCliSession(unittest.TestCase):
     def test_08_history_export_excludes_typed_text(self):
         """history records operations and outcomes, never typed text."""
         cli_ok("session", "start")
+        cli_ok("windows")
         env = cli_ok("history")
         entries = env["result"]["entries"]
         self.assertTrue(entries, "history should not be empty")

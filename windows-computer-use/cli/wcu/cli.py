@@ -22,28 +22,9 @@ from typing import Any, Callable, Dict, List, Optional
 
 from wcu import __version__
 from wcu import session as sess
+from wcu.constants import REFUSAL_CODES
 from wcu.ipc import PipeError
 from wcu.paths import default_engine_path
-
-# Error codes that mean "refused, no input was dispatched". A refusal is an
-# honest outcome, not a transport failure.
-REFUSAL_CODES = {
-    "stale_observation",
-    "geometry_changed",
-    "foreground_changed",
-    "target_occluded",
-    "invalid_coordinates",
-    "window_gone",
-    "desktop_inaccessible",
-    "focus_refused",
-    "unknown_key",
-    "invalid_request",
-    "unsupported",
-    "no_monitors",
-    "monitor_not_found",
-    "invalid_monitor_handle",
-    "window_not_found",
-}
 
 USAGE_EXIT = 2
 TRANSPORT_EXIT = 1
@@ -156,7 +137,7 @@ def cmd_capabilities(args: argparse.Namespace) -> int:
     except PipeError as e:
         return _handle_pipe_error(e)
     if not resp.get("ok"):
-        return _emit(_error_env(None, resp["error"]["code"], resp["error"]["message"], resp["error"].get("details")))
+        return _emit(_error_env(_session_id(), resp["error"]["code"], resp["error"]["message"], resp["error"].get("details")))
     return _emit(_envelope(_session_id(), True, "ok", result=resp["result"]))
 
 
@@ -188,7 +169,7 @@ def cmd_session_status(args: argparse.Namespace) -> int:
     except PipeError as e:
         return _handle_pipe_error(e)
     if not resp.get("ok"):
-        return _emit(_error_env(None, resp["error"]["code"], resp["error"]["message"], resp["error"].get("details")))
+        return _emit(_error_env(_session_id(), resp["error"]["code"], resp["error"]["message"], resp["error"].get("details")))
     return _emit(_envelope(_session_id(), True, "ok", result=resp["result"]))
 
 
@@ -208,7 +189,7 @@ def cmd_windows(args: argparse.Namespace) -> int:
     except PipeError as e:
         return _handle_pipe_error(e)
     if not resp.get("ok"):
-        return _emit(_error_env(None, resp["error"]["code"], resp["error"]["message"], resp["error"].get("details")))
+        return _emit(_error_env(_session_id(), resp["error"]["code"], resp["error"]["message"], resp["error"].get("details")))
     return _emit(_envelope(_session_id(), True, "ok", result=resp["result"]))
 
 
@@ -220,7 +201,7 @@ def cmd_monitors(args: argparse.Namespace) -> int:
     except PipeError as e:
         return _handle_pipe_error(e)
     if not resp.get("ok"):
-        return _emit(_error_env(None, resp["error"]["code"], resp["error"]["message"], resp["error"].get("details")))
+        return _emit(_error_env(_session_id(), resp["error"]["code"], resp["error"]["message"], resp["error"].get("details")))
     return _emit(_envelope(_session_id(), True, "ok", result=resp["result"]))
 
 
@@ -232,7 +213,7 @@ def cmd_attach(args: argparse.Namespace) -> int:
     except PipeError as e:
         return _handle_pipe_error(e)
     if not resp.get("ok"):
-        return _emit(_error_env(None, resp["error"]["code"], resp["error"]["message"], resp["error"].get("details")))
+        return _emit(_error_env(_session_id(), resp["error"]["code"], resp["error"]["message"], resp["error"].get("details")))
     return _emit(_envelope(_session_id(), True, "ok", result=resp["result"]))
 
 
@@ -244,7 +225,7 @@ def cmd_focus(args: argparse.Namespace) -> int:
     except PipeError as e:
         return _handle_pipe_error(e)
     if not resp.get("ok"):
-        return _emit(_error_env(None, resp["error"]["code"], resp["error"]["message"], resp["error"].get("details")))
+        return _emit(_error_env(_session_id(), resp["error"]["code"], resp["error"]["message"], resp["error"].get("details")))
     return _emit(_envelope(_session_id(), True, "ok", result=resp["result"]))
 
 
@@ -256,7 +237,7 @@ def cmd_switch(args: argparse.Namespace) -> int:
     except PipeError as e:
         return _handle_pipe_error(e)
     if not resp.get("ok"):
-        return _emit(_error_env(None, resp["error"]["code"], resp["error"]["message"], resp["error"].get("details")))
+        return _emit(_error_env(_session_id(), resp["error"]["code"], resp["error"]["message"], resp["error"].get("details")))
     return _emit(_envelope(_session_id(), True, "ok", result=resp["result"]))
 
 
@@ -268,7 +249,7 @@ def cmd_observe(args: argparse.Namespace) -> int:
     except PipeError as e:
         return _handle_pipe_error(e)
     if not resp.get("ok"):
-        return _emit(_error_env(None, resp["error"]["code"], resp["error"]["message"], resp["error"].get("details")))
+        return _emit(_error_env(_session_id(), resp["error"]["code"], resp["error"]["message"], resp["error"].get("details")))
     return _emit(_envelope(_session_id(), True, "ok", result=resp["result"]))
 
 
@@ -288,7 +269,7 @@ def cmd_inspect(args: argparse.Namespace) -> int:
     except PipeError as e:
         return _handle_pipe_error(e)
     if not resp.get("ok"):
-        return _emit(_error_env(None, resp["error"]["code"], resp["error"]["message"], resp["error"].get("details")))
+        return _emit(_error_env(_session_id(), resp["error"]["code"], resp["error"]["message"], resp["error"].get("details")))
     return _emit(_envelope(_session_id(), True, "ok", result=resp["result"]))
 
 
@@ -300,7 +281,7 @@ def cmd_history(args: argparse.Namespace) -> int:
     except PipeError as e:
         return _handle_pipe_error(e)
     if not resp.get("ok"):
-        return _emit(_error_env(None, resp["error"]["code"], resp["error"]["message"], resp["error"].get("details")))
+        return _emit(_error_env(_session_id(), resp["error"]["code"], resp["error"]["message"], resp["error"].get("details")))
     return _emit(_envelope(_session_id(), True, "ok", result=resp["result"]))
 
 
@@ -312,22 +293,23 @@ def cmd_cancel(args: argparse.Namespace) -> int:
     except PipeError as e:
         return _handle_pipe_error(e)
     if not resp.get("ok"):
-        return _emit(_error_env(None, resp["error"]["code"], resp["error"]["message"], resp["error"].get("details")))
+        return _emit(_error_env(_session_id(), resp["error"]["code"], resp["error"]["message"], resp["error"].get("details")))
     return _emit(_envelope(_session_id(), True, "ok", result=resp["result"]))
 
 
 def cmd_open(args: argparse.Namespace) -> int:
     if not args.program:
-        print("wcu open: a program name is required", file=sys.stderr)
-        return USAGE_EXIT
+        return _emit(_error_env(_session_id(), "invalid_request", "open needs a program name"))
     try:
         proc = subprocess.Popen([args.program] + list(args.args))
     except FileNotFoundError:
-        print(f"wcu open: program not found: {args.program}", file=sys.stderr)
-        return USAGE_EXIT
+        return _emit(
+            _error_env(_session_id(), "program_not_found", f"Program not found: {args.program}")
+        )
     except OSError as e:
-        print(f"wcu open: could not launch {args.program}: {e}", file=sys.stderr)
-        return USAGE_EXIT
+        return _emit(
+            _error_env(_session_id(), "open_failed", f"Could not launch {args.program}: {e}")
+        )
     return _emit(
         _envelope(
             _session_id(),

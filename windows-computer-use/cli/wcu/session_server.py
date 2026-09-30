@@ -40,28 +40,9 @@ if _client not in sys.path:
 from wcu_client import WcuClient, WcuError  # noqa: E402
 
 from wcu import ipc  # noqa: E402
+from wcu.constants import REFUSAL_CODES  # noqa: E402
 from wcu.history import History  # noqa: E402
 from wcu.imaging import save_observation_png  # noqa: E402
-
-# Error codes that mean "the proposal was refused, no input was dispatched".
-# These return updated evidence so the caller can reconsider.
-REFUSAL_CODES = {
-    "stale_observation",
-    "geometry_changed",
-    "foreground_changed",
-    "target_occluded",
-    "invalid_coordinates",
-    "window_gone",
-    "desktop_inaccessible",
-    "focus_refused",
-    "unknown_key",
-    "invalid_request",
-    "unsupported",
-    "no_monitors",
-    "monitor_not_found",
-    "invalid_monitor_handle",
-    "window_not_found",
-}
 
 
 def _pid_alive(pid: int) -> bool:
@@ -260,8 +241,11 @@ class SessionServer:
             "truncated": truncated,
             "count": len(elements),
         }
-        if args.get("question"):
-            result["question"] = str(args["question"])
+        question = args.get("question")
+        if question:
+            result["question"] = str(question)
+            # Record the question so history shows what each inspection served.
+            self.history.record("inspect", "ok", question=str(question))
         return result
 
     def op_history(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -315,7 +299,8 @@ class SessionServer:
                 raise WcuError("cancelled", "Operation cancelled") from e
             if e.code in REFUSAL_CODES and not dry_run:
                 # The proposal no longer applies. Return updated evidence so
-                # the caller can reconsider without redundant setup.
+                # the caller can reconsider without redundant setup. The
+                # evidence rides in the error details; the envelope is ok:false.
                 evidence = self._observe_and_save()
                 self.history.record(
                     f"act:{action}",
@@ -323,12 +308,11 @@ class SessionServer:
                     observation_id=obs_id,
                     error_code=e.code,
                 )
-                return {
-                    "status": "refused",
-                    "action": action,
-                    "error": {"code": e.code, "message": e.message},
-                    "evidence": evidence,
-                }
+                raise WcuError(
+                    e.code,
+                    e.message,
+                    {"evidence": evidence, "action": action},
+                ) from e
             raise
 
         outcome = "dry_run" if dry_run else "ok"
@@ -472,6 +456,9 @@ class SessionServer:
                 request, "unsupported", f"Unknown operation '{op}'"
             )
         is_local = op in self.LOCAL_OPS
+        # A cancel that arrived while no operation was pending is a no-op;
+        # clear it here so it never poisons the next command.
+        self.cancel_event.clear()
         try:
             with self._op_lock:
                 self.in_flight = not is_local
@@ -643,15 +630,7 @@ class SessionServer:
                         continue
                     else:
                         request = ipc.parse_message(data)
-                        if self.cancel_event.is_set():
-                            # A cancel arrived while this request was queued.
-                            self.cancel_event.clear()
-                            response = error_response(
-                                request, "cancelled",
-                                "Operation cancelled",
-                            )
-                        else:
-                            response = self.handle(request)
+                        response = self.handle(request)
                 except pywintypes.error:
                     # Client went away; nothing to respond to.
                     continue
