@@ -106,6 +106,22 @@ class WcuClient:
         with self._lock:
             self._stop_locked()
 
+    def kill(self) -> None:
+        """Terminate the engine process immediately, without waiting.
+
+        Used by cancellation. A pending operation holds ``self._lock`` for
+        its whole duration, so going through ``stop()`` would block until
+        that operation finished -- exactly what cancellation must avoid.
+        Terminating the process closes the pipes and unblocks the pending
+        read at once, so the in-flight operation fails fast and reports.
+        """
+        proc = self._proc
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+
     @property
     def pid(self) -> Optional[int]:
         return self._proc.pid if self._proc else None
@@ -175,6 +191,16 @@ class WcuClient:
 
                 resp_bytes = _read_exact_proc(resp_len)
                 resp_obj = json.loads(resp_bytes.decode("utf-8"))
+
+                # The engine echoes the request id. A mismatch means this
+                # response belongs to an earlier request (stale) or was
+                # misrouted; never let it satisfy the current one.
+                resp_id = resp_obj.get("id")
+                if resp_id is not None and resp_id != req_id:
+                    raise WcuError(
+                        "stale_response",
+                        f"Response id {resp_id} does not match request id {req_id}",
+                    )
 
                 resp_payload = b""
                 resp_payload_len = resp_obj.get("payload_len", 0)
@@ -473,8 +499,13 @@ class WcuClient:
         delay_ms: Optional[int] = None,
         dry_run: bool = False,
         timeout_sec: float = 20.0,
+        method: str = "unicode",
     ) -> Dict[str, Any]:
-        """Type text as Unicode key events, one UTF-16 code unit at a time.
+        """Type text: unicode key events, paste, or a single commit message.
+
+        method="paste" delivers through the clipboard with readback verification.
+        method="commit" sends one EM_REPLACESEL message to the focused editor and
+        verifies by readback, without touching the clipboard or the input stream.
 
         Keyboard actions bind to window identity and foreground rather than to a
         point, so no pointer target is accepted here. Supplying an observation id
@@ -489,6 +520,7 @@ class WcuClient:
             args["observation_id"] = observation_id
         if delay_ms is not None:
             args["delay_ms"] = delay_ms
+        args["method"] = method
         return self.request("type_text", args, timeout_sec=timeout_sec)
 
     def press_key(

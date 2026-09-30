@@ -1138,6 +1138,81 @@ class TestPhase7DesktopActions(unittest.TestCase):
         self.assertEqual(self._field_text(), before)
 
     # ------------------------------------------------------------------
+    # 2b. Committed-text insertion (runs after test_27 by name order)
+    # ------------------------------------------------------------------
+
+    def _clear_field(self) -> None:
+        """Empty the typing target through UIA (setup, not the dispatch under test)."""
+        el = self._by_id("txt_target")
+        self.client.uia_action(token=el["token"], action="set_value", value="")
+        self._wait_until(
+            lambda: self._field_text() == "", "Field did not clear"
+        )
+
+    def _focus_field(self) -> None:
+        """Put the caret in the typing target, so insertion has somewhere to go."""
+        meta = self._observe()
+        field = self._frame_target("txt_target", meta)
+        click_res = self.client.click(
+            observation_id=meta["observation_id"],
+            target_bbox_frame_px=field,
+            max_age_ms=2000,
+        )
+        self.assertEqual(click_res.get("status"), "clicked")
+        time.sleep(0.2)
+
+    def test_28_commit_inserts_text_without_touching_the_clipboard(self):
+        """A single edit message lands byte-perfect with no input events."""
+        self._clear_field()
+        self._focus_field()
+
+        text = "Hello Commit 42"
+        res = self.client.type_text(text, method="commit", timeout_sec=20.0)
+        self.assertEqual(res.get("status"), "typed")
+        self.assertEqual(res.get("method"), "commit")
+        self.assertEqual(res.get("messages_sent"), 1)
+        self.assertEqual(res.get("events_injected"), 0)
+        self.assertEqual(res.get("verification"), "matched")
+        self.assertEqual(res.get("clipboard"), "unchanged")
+        print(f"\n[Test 28] type_text commit dispatched: {res}")
+
+        time.sleep(0.4)
+        self.assertEqual(self._field_text(), text, "The field did not receive the committed text")
+
+    def test_29_commit_handles_unicode(self):
+        """Accented and non-Latin text arrives intact through the message path."""
+        self._clear_field()
+        self._focus_field()
+
+        text = "café 日本語 ✓"
+        res = self.client.type_text(text, method="commit", timeout_sec=20.0)
+        self.assertEqual(res.get("status"), "typed")
+        self.assertEqual(res.get("verification"), "matched")
+        print(f"\n[Test 29] type_text commit dispatched: {res}")
+
+        time.sleep(0.4)
+        self.assertEqual(self._field_text(), text, "Unicode committed text was mangled")
+
+    def test_30_commit_inserts_at_the_caret_in_a_nonempty_field(self):
+        """With TextPattern the selection is known, so mid-document insertion is
+        verified exactly, not just appended."""
+        el = self._by_id("txt_target")
+        self.client.uia_action(token=el["token"], action="set_value", value="seed 123")
+        self._wait_until(lambda: self._field_text() == "seed 123", "Field did not seed")
+        self._focus_field()
+        self.client.press_key("end")
+        time.sleep(0.2)
+
+        res = self.client.type_text("!", method="commit", timeout_sec=20.0)
+        self.assertEqual(res.get("status"), "typed")
+        self.assertEqual(res.get("verification"), "matched")
+        print(f"\n[Test 30] type_text commit dispatched: {res}")
+
+        time.sleep(0.4)
+        self.assertEqual(self._field_text(), "seed 123!", "Commit did not land at the caret")
+        self._clear_field()
+
+    # ------------------------------------------------------------------
     # 9. Window focus and switching
     # ------------------------------------------------------------------
 

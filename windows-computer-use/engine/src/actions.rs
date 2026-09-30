@@ -15,6 +15,7 @@ use crate::protocol::ProtocolError;
 use serde::Deserialize;
 use serde_json::json;
 use std::thread::sleep;
+use windows::Win32::UI::Input::KeyboardAndMouse::INPUT;
 use std::time::Duration;
 
 /// Longest string accepted by `type_text`, so a runaway request fails cleanly
@@ -39,15 +40,28 @@ fn default_false() -> bool {
 // Typing
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum TypeMethod {
+    #[default]
+    Unicode,
+    Paste,
+    Commit,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct TypeTextArgs {
     pub text: String,
     #[serde(default)]
+    pub method: TypeMethod,
+    #[serde(default)]
     pub observation_id: Option<u64>,
     #[serde(default = "default_max_age_ms")]
     pub max_age_ms: u64,
-    /// Optional per-character delay. A small number of applications drop
-    /// characters from a single unthrottled batch.
+    /// Optional per-character delay. Leave unset to deliver the whole string in
+    /// a single input-queue call. Set it for an application that needs the
+    /// keystrokes spaced out in real time; that path costs one input-queue call
+    /// per character and is correspondingly slower to fail atomically.
     #[serde(default)]
     pub delay_ms: Option<u64>,
     #[serde(default = "default_false")]
@@ -59,6 +73,15 @@ pub fn execute_type_text(
     last_obs: Option<&LastObservation>,
     args: TypeTextArgs,
 ) -> Result<serde_json::Value, ProtocolError> {
+    if args.method == TypeMethod::Paste && args.text.contains('\0') {
+        return Err(ProtocolError::new("invalid_request", "Clipboard text cannot contain NUL"));
+    }
+    if args.method == TypeMethod::Commit && args.text.contains('\0') {
+        return Err(ProtocolError::new("invalid_request", "Committed text cannot contain NUL"));
+    }
+    if args.method != TypeMethod::Unicode && args.delay_ms.is_some() {
+        return Err(ProtocolError::new("invalid_request", "delay_ms is only supported by the unicode method"));
+    }
     let char_count = args.text.chars().count();
     if char_count > MAX_TYPE_CHARS {
         return Err(ProtocolError::new(
@@ -77,14 +100,19 @@ pub fn execute_type_text(
         args.max_age_ms,
     )?;
 
-    // One UTF-16 code unit at a time, with a matching key-up per key-down, so no
-    // character is dropped or substituted and non-BMP text arrives as its
-    // surrogate pair.
+    // Count UTF-16 units for both delivery methods. Event acceptance alone
+    // does not establish what a receiving application recorded.
     let code_units: Vec<u16> = args.text.encode_utf16().collect();
 
     let mut result = json!({
         "status": if args.dry_run { "dry_run" } else { "typed" },
         "action": "type_text",
+        "method": match args.method {
+            TypeMethod::Paste => "paste",
+            TypeMethod::Commit => "commit",
+            TypeMethod::Unicode => "unicode",
+        },
+        "verification": "unavailable",
         "characters_sent": char_count,
         "code_units_sent": code_units.len(),
         "observation_id": plan.observation_id,
@@ -98,13 +126,53 @@ pub fn execute_type_text(
         return Ok(result);
     }
 
+    if args.method == TypeMethod::Paste {
+        let delivery = crate::text_paste::execute(
+            attached, last_obs, args.observation_id, args.max_age_ms, &args.text,
+        )?;
+        result.as_object_mut().expect("type result is an object").extend(
+            delivery.as_object().expect("paste result is an object").clone(),
+        );
+        return Ok(result);
+    }
+
+    if args.method == TypeMethod::Commit {
+        let delivery = crate::text_commit::execute(
+            attached, last_obs, args.observation_id, args.max_age_ms, &args.text,
+        )?;
+        result.as_object_mut().expect("type result is an object").extend(
+            delivery.as_object().expect("commit result is an object").clone(),
+        );
+        return Ok(result);
+    }
+
     let mut events_injected = 0u32;
     let delay = Duration::from_millis(args.delay_ms.unwrap_or(0));
 
-    for unit in &code_units {
-        let pair = [unicode_key_input(*unit, false), unicode_key_input(*unit, true)];
-        events_injected += inject(&pair, &[])?;
-        if !delay.is_zero() {
+    if delay.is_zero() {
+        // Deliver the whole string in one SendInput call. The benefit that is
+        // actually observable is atomic error detection: `inject` reports how
+        // many events the queue accepted, so a partial injection is caught in one
+        // check instead of surfacing halfway through a string with the earlier
+        // characters already committed and no record of where delivery stopped.
+        //
+        // Modern Notepad has corrupted this Unicode event path in acceptance
+        // testing regardless of batching. The mechanism is documented in
+        // docs/windows-text-input-apis.md; use explicit commit mode for
+        // verified message delivery (paste as fallback).
+        let mut batch: Vec<INPUT> = Vec::with_capacity(code_units.len() * 2);
+        for unit in &code_units {
+            batch.push(unicode_key_input(*unit, false));
+            batch.push(unicode_key_input(*unit, true));
+        }
+        events_injected = inject(&batch, &[])?;
+    } else {
+        // Throttled path: the caller asked for characters spaced out in real
+        // time, so each character is its own call and the gap is honoured
+        // between them.
+        for unit in &code_units {
+            let pair = [unicode_key_input(*unit, false), unicode_key_input(*unit, true)];
+            events_injected += inject(&pair, &[])?;
             sleep(delay);
         }
     }

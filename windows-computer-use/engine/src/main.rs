@@ -1,9 +1,13 @@
 mod actions;
 mod capture;
+mod clipboard;
+mod editor;
 mod guard;
 mod input;
 mod keys;
 mod protocol;
+mod text_commit;
+mod text_paste;
 mod uia;
 mod win_utils;
 
