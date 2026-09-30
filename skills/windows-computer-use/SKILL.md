@@ -58,6 +58,11 @@ bounds from the observation.
   hit-test before dispatching. A changed target returns `refused` with new
   evidence — reconsider, never replay the old target.
 - Add `--dry-run` to validate a proposal without dispatching input.
+- `status: "typed"` proves dispatch, not what the application recorded. Read
+  text back after typing — `inspect` for an accessible value, or `observe` and
+  look at the frame. Some applications mangle injected text regardless of how
+  it is batched; repeating the same call will not fix it. See the CLI README's
+  "Known limitations".
 - `inspect` answers a named-control or region question when the screenshot is
   ambiguous. It is not a routine confidence check after visual identification.
 
@@ -84,3 +89,9 @@ For a concrete failure, run the command with `--help` and check the error code
 in the result envelope. Common codes: `no_session` (run `session start`),
 `engine_not_found` (build the engine), `foreground_changed` (the target is not
 in front — `switch` to it), `stale_observation` (re-observe and act promptly).
+
+A `typed` result with garbled text in the target is not a refusal and carries
+no error code — the input was dispatched and the application discarded or
+substituted it. Modern Windows 11 Notepad does this reproducibly with injected
+keystrokes. Switch to a target whose text entry is verified rather than
+retrying.

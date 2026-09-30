@@ -15,6 +15,7 @@ use crate::protocol::ProtocolError;
 use serde::Deserialize;
 use serde_json::json;
 use std::thread::sleep;
+use windows::Win32::UI::Input::KeyboardAndMouse::INPUT;
 use std::time::Duration;
 
 /// Longest string accepted by `type_text`, so a runaway request fails cleanly
@@ -46,8 +47,10 @@ pub struct TypeTextArgs {
     pub observation_id: Option<u64>,
     #[serde(default = "default_max_age_ms")]
     pub max_age_ms: u64,
-    /// Optional per-character delay. A small number of applications drop
-    /// characters from a single unthrottled batch.
+    /// Optional per-character delay. Leave unset to deliver the whole string in
+    /// a single input-queue call. Set it for an application that needs the
+    /// keystrokes spaced out in real time; that path costs one input-queue call
+    /// per character and is correspondingly slower to fail atomically.
     #[serde(default)]
     pub delay_ms: Option<u64>,
     #[serde(default = "default_false")]
@@ -101,10 +104,31 @@ pub fn execute_type_text(
     let mut events_injected = 0u32;
     let delay = Duration::from_millis(args.delay_ms.unwrap_or(0));
 
-    for unit in &code_units {
-        let pair = [unicode_key_input(*unit, false), unicode_key_input(*unit, true)];
-        events_injected += inject(&pair, &[])?;
-        if !delay.is_zero() {
+    if delay.is_zero() {
+        // Deliver the whole string in one SendInput call. The benefit that is
+        // actually observable is atomic error detection: `inject` reports how
+        // many events the queue accepted, so a partial injection is caught in one
+        // check instead of surfacing halfway through a string with the earlier
+        // characters already committed and no record of where delivery stopped.
+        //
+        // This does not make text entry reliable in every application. Targets
+        // that route keystrokes through a TSF text service (the modern Notepad
+        // among them) can still drop or substitute characters regardless of how
+        // the events are batched; that is a property of the receiving
+        // application, not of the dispatch.
+        let mut batch: Vec<INPUT> = Vec::with_capacity(code_units.len() * 2);
+        for unit in &code_units {
+            batch.push(unicode_key_input(*unit, false));
+            batch.push(unicode_key_input(*unit, true));
+        }
+        events_injected = inject(&batch, &[])?;
+    } else {
+        // Throttled path: the caller asked for characters spaced out in real
+        // time, so each character is its own call and the gap is honoured
+        // between them.
+        for unit in &code_units {
+            let pair = [unicode_key_input(*unit, false), unicode_key_input(*unit, true)];
+            events_injected += inject(&pair, &[])?;
             sleep(delay);
         }
     }

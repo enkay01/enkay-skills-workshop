@@ -241,6 +241,7 @@ class TestCliSession(unittest.TestCase):
         """--dry-run validates the proposal without changing app state."""
         cli_ok("session", "start")
         before = self._counter()
+        self._focus_fixture()
         obs = self._observe()
         insp = cli_ok("inspect", "--max-elements", "60")["result"]
         btn = next(
@@ -274,14 +275,39 @@ class TestCliSession(unittest.TestCase):
         cur_h = rect.bottom - rect.top
 
         try:
+            # Observe first: the refusal is only meaningful when the observation
+            # predates the move, so the engine can compare the frame it handed
+            # out against the window's current geometry.
+            self._focus_fixture()
+            obs = self._observe()
+            insp = cli_ok("inspect", "--max-elements", "60")["result"]
+            btn = next(
+                (
+                    e
+                    for e in insp["elements"]
+                    if e.get("name") == "Continue"
+                    and "Button" in e.get("control_type", "")
+                ),
+                None,
+            )
+            self.assertIsNotNone(btn, "Continue button not found via inspect")
+            bounds = obs["capture_bounds_physical_px"]
+            bb = btn["bounds"]
+
             user32.MoveWindow(hwnd_int, rect.left + 60, rect.top + 60, cur_w, cur_h, True)
             user32.SetForegroundWindow(hwnd_int)
             time.sleep(0.3)
 
-            env = self._click_continue()
+            env = cli_json(
+                "act", "click",
+                "--observation-id", str(obs["observation_id"]),
+                "--bbox", str(bb["x"] - bounds["x"]), str(bb["y"] - bounds["y"]),
+                str(bb["w"]), str(bb["h"]),
+                "--max-age-ms", MAX_AGE_MS,
+            )
             self.assertFalse(env["ok"], "moved-window click should be refused")
             self.assertEqual(env["status"], "refused")
-            self.assertIn(env["error"]["code"], ["geometry_changed", "foreground_changed"])
+            self.assertEqual(env["error"]["code"], "geometry_changed")
             # Updated evidence is returned for reconsideration.
             self.assertIn("evidence", env["error"].get("details", {}) or {})
         finally:

@@ -74,3 +74,32 @@ was produced, `1` transport failure, `2` usage error.
 The session process owns the `WcuClient` (and therefore the Rust engine)
 across independent CLI invocations, so capture state, attachments, and
 observation identity survive between commands.
+
+## Known limitations
+
+**Some applications mangle injected text.** `act type` dispatches one
+`KEYEVENTF_UNICODE` key-down/key-up pair per UTF-16 code unit and reports
+exactly what it injected. The engine's delivery is correct — it has been
+verified against a classic WinForms text box, where accented and non-Latin
+text arrives intact — but an application that routes keystrokes through a TSF
+text service can still drop or substitute characters after they reach it. The
+modern Windows 11 Notepad does this reproducibly: injecting
+`wcu typed this sentence.` yields `wcu ........` while `events_injected`
+reports the full 24 characters. No amount of per-character delay, chunking,
+or input batching changes it, because the loss happens in the receiving
+application rather than in the dispatch.
+
+Treat a green `status: "typed"` as proof of dispatch, not of what the
+application recorded. After typing into an unfamiliar target, read the result
+back — `inspect` for an accessible value, or `observe` and look at the frame —
+before reporting success. If the text is mangled, prefer a target whose text
+entry is verified over repeating the same call.
+
+**Foreground is a real constraint.** Guarded actions refuse unless the
+attached window is the foreground window, so they return `foreground_changed`
+or `focus_refused` rather than typing into whatever happens to be in front.
+Windows also declines to move foreground between processes that are not
+eligible, so `focus`/`switch` can be refused when the calling terminal holds
+focus. A freshly launched process is eligible; `wcu open` followed immediately
+by `switch` and the action in one uninterrupted sequence is the reliable
+pattern.
