@@ -332,6 +332,10 @@ def cmd_act(args: argparse.Namespace) -> int:
         action_args["point"] = args.point
     if getattr(args, "text", None) is not None:
         action_args["text"] = args.text
+    if getattr(args, "method", None) is not None:
+        action_args["method"] = args.method
+    if getattr(args, "delay_ms", None) is not None:
+        action_args["delay_ms"] = args.delay_ms
     if getattr(args, "chord", None) is not None:
         action_args["chord"] = args.chord
     if getattr(args, "button", None):
@@ -464,6 +468,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_type.add_argument("--text", required=True)
     p_type.add_argument("--observation-id", type=int, default=None)
     p_type.add_argument("--delay-ms", type=int, default=None)
+    p_type.add_argument("--method", choices=["unicode", "paste", "commit"], default="unicode",
+                        help="paste uses the clipboard and verifies editor content; commit inserts one edit message and verifies")
     p_type.set_defaults(func=cmd_act)
 
     p_press = act_sub.add_parser("press", help="press a key chord")
@@ -498,14 +504,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_drag.set_defaults(func=cmd_act)
 
     p_act_focus = act_sub.add_parser("focus", help="focus a window (semantic action)")
+    _add_act_common(p_act_focus)
     p_act_focus.add_argument("--hwnd", required=True)
     p_act_focus.set_defaults(func=cmd_act)
 
     p_invoke = act_sub.add_parser("invoke", help="invoke a UIA element")
+    _add_act_common(p_invoke)
     p_invoke.add_argument("--token", required=True)
     p_invoke.set_defaults(func=cmd_act)
 
     p_setval = act_sub.add_parser("set-value", help="set a UIA element value")
+    _add_act_common(p_setval)
     p_setval.add_argument("--token", required=True)
     p_setval.add_argument("--value", default=None)
     p_setval.set_defaults(func=cmd_act)

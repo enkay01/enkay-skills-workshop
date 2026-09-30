@@ -499,8 +499,13 @@ class WcuClient:
         delay_ms: Optional[int] = None,
         dry_run: bool = False,
         timeout_sec: float = 20.0,
+        method: str = "unicode",
     ) -> Dict[str, Any]:
-        """Type text as Unicode key events, one UTF-16 code unit at a time.
+        """Type text: unicode key events, paste, or a single commit message.
+
+        method="paste" delivers through the clipboard with readback verification.
+        method="commit" sends one EM_REPLACESEL message to the focused editor and
+        verifies by readback, without touching the clipboard or the input stream.
 
         Keyboard actions bind to window identity and foreground rather than to a
         point, so no pointer target is accepted here. Supplying an observation id
@@ -515,6 +520,7 @@ class WcuClient:
             args["observation_id"] = observation_id
         if delay_ms is not None:
             args["delay_ms"] = delay_ms
+        args["method"] = method
         return self.request("type_text", args, timeout_sec=timeout_sec)
 
     def press_key(

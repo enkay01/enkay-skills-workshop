@@ -29,7 +29,7 @@ user32 = ctypes.windll.user32
 
 # A generous observation age: each CLI invocation is a fresh Python process,
 # so the gap between observe and act is longer than an in-process call.
-MAX_AGE_MS = "8000"
+MAX_AGE_MS = 8000
 
 
 def run_cli(*args: str, timeout: float = 90.0) -> subprocess.CompletedProcess:
@@ -136,14 +136,14 @@ class TestCliSession(unittest.TestCase):
         self._ensure_attached()
         return cli_ok("observe")["result"]
 
-    def _click_continue(self) -> dict:
-        """Focus the fixture, then click its Continue button.
+    def _continue_bbox(self, obs: dict) -> list[str]:
+        """The Continue button's bbox in observation-frame coordinates.
 
-        Uses UIA bounds mapped into the observation frame. Guarded actions
-        require the target in the foreground, so the fixture is focused first.
+        The element is looked up through UIA and mapped into the frame in one
+        place, so every test that clicks it targets the same button the same
+        way. A bare name match is not enough: the fixture's accessibility tree
+        can contain other elements named "Continue".
         """
-        self._focus_fixture()
-        obs = self._observe()
         insp = cli_ok("inspect", "--max-elements", "60")["result"]
         btn = next(
             (
@@ -157,14 +157,31 @@ class TestCliSession(unittest.TestCase):
         self.assertIsNotNone(btn, "Continue button not found via inspect")
         bounds = obs["capture_bounds_physical_px"]
         bb = btn["bounds"]
-        bx = bb["x"] - bounds["x"]
-        by = bb["y"] - bounds["y"]
-        return cli_json(
-            "act", "click",
-            "--observation-id", str(obs["observation_id"]),
-            "--bbox", str(bx), str(by), str(bb["w"]), str(bb["h"]),
-            "--max-age-ms", MAX_AGE_MS,
-        )
+        return [
+            str(bb["x"] - bounds["x"]),
+            str(bb["y"] - bounds["y"]),
+            str(bb["w"]),
+            str(bb["h"]),
+        ]
+
+    def _act_click(self, obs: dict, bbox: list[str], dry_run: bool = False) -> dict:
+        """Dispatch a guarded click bound to a specific observation and bbox."""
+        args = ["act", "click", "--observation-id", str(obs["observation_id"])]
+        if dry_run:
+            args.append("--dry-run")
+        args += ["--bbox", *bbox, "--max-age-ms", str(MAX_AGE_MS)]
+        return cli_json(*args)
+
+    def _click_continue(self, dry_run: bool = False) -> dict:
+        """Focus the fixture, then click its Continue button.
+
+        Guarded actions require the target in the foreground, so the fixture is
+        focused first. The click binds to the observation taken after focusing,
+        because focusing clears any earlier observation.
+        """
+        self._focus_fixture()
+        obs = self._observe()
+        return self._act_click(obs, self._continue_bbox(obs), dry_run=dry_run)
 
     # ------------------------------------------------------------------
     # Tests
@@ -241,22 +258,7 @@ class TestCliSession(unittest.TestCase):
         """--dry-run validates the proposal without changing app state."""
         cli_ok("session", "start")
         before = self._counter()
-        self._focus_fixture()
-        obs = self._observe()
-        insp = cli_ok("inspect", "--max-elements", "60")["result"]
-        btn = next(
-            (e for e in insp["elements"] if e.get("name") == "Continue"), None
-        )
-        self.assertIsNotNone(btn)
-        bounds = obs["capture_bounds_physical_px"]
-        bb = btn["bounds"]
-        env = cli_json(
-            "act", "click", "--dry-run",
-            "--observation-id", str(obs["observation_id"]),
-            "--bbox", str(bb["x"] - bounds["x"]), str(bb["y"] - bounds["y"]),
-            str(bb["w"]), str(bb["h"]),
-            "--max-age-ms", MAX_AGE_MS,
-        )
+        env = self._click_continue(dry_run=True)
         self.assertTrue(env["ok"], f"dry-run refused: {env}")
         self.assertEqual(env["status"], "dry_run")
         self.assertEqual(env["result"]["dispatch"]["events_injected"], 0)
@@ -280,31 +282,13 @@ class TestCliSession(unittest.TestCase):
             # out against the window's current geometry.
             self._focus_fixture()
             obs = self._observe()
-            insp = cli_ok("inspect", "--max-elements", "60")["result"]
-            btn = next(
-                (
-                    e
-                    for e in insp["elements"]
-                    if e.get("name") == "Continue"
-                    and "Button" in e.get("control_type", "")
-                ),
-                None,
-            )
-            self.assertIsNotNone(btn, "Continue button not found via inspect")
-            bounds = obs["capture_bounds_physical_px"]
-            bb = btn["bounds"]
+            bbox = self._continue_bbox(obs)
 
             user32.MoveWindow(hwnd_int, rect.left + 60, rect.top + 60, cur_w, cur_h, True)
             user32.SetForegroundWindow(hwnd_int)
             time.sleep(0.3)
 
-            env = cli_json(
-                "act", "click",
-                "--observation-id", str(obs["observation_id"]),
-                "--bbox", str(bb["x"] - bounds["x"]), str(bb["y"] - bounds["y"]),
-                str(bb["w"]), str(bb["h"]),
-                "--max-age-ms", MAX_AGE_MS,
-            )
+            env = self._act_click(obs, bbox)
             self.assertFalse(env["ok"], "moved-window click should be refused")
             self.assertEqual(env["status"], "refused")
             self.assertEqual(env["error"]["code"], "geometry_changed")
@@ -336,10 +320,15 @@ class TestCliSession(unittest.TestCase):
         """Screenshots are written under the session dir and removed on stop."""
         from wcu.paths import shots_dir
 
-        cli_ok("session", "start")
+        session_id = cli_ok("session", "start")["result"]["session_id"]
         obs = self._observe()
         path = obs["image_path"]
         self.assertTrue(os.path.exists(path))
+        self.assertEqual(
+            os.path.normcase(os.path.normpath(os.path.dirname(path))),
+            os.path.normcase(os.path.normpath(str(shots_dir(session_id)))),
+            "screenshot must be written to the session shots directory",
+        )
 
         cli_ok("session", "stop")
         self.assertFalse(
@@ -391,6 +380,26 @@ class TestCliSession(unittest.TestCase):
         self.assertEqual(
             back["result"]["observation"]["window_identity"]["hwnd"], hwnd
         )
+
+    def test_12_act_subparsers_share_common_flags(self):
+        """Every act subparser accepts --dry-run/--max-age-ms.
+
+        Regression: set-value, invoke, and focus never got the common flags,
+        so any use crashed with AttributeError before reaching the session.
+        With no session running these produce error envelopes, not tracebacks.
+        """
+        cases = [
+            ["act", "set-value", "--token", "x", "--value", "y", "--dry-run"],
+            ["act", "invoke", "--token", "x", "--dry-run"],
+            ["act", "focus", "--hwnd", "123", "--dry-run"],
+        ]
+        for args in cases:
+            proc = run_cli(*args)
+            self.assertEqual(
+                proc.returncode, 0, f"wcu {' '.join(args)} crashed: {proc.stderr[-500:]}"
+            )
+            env = json.loads(proc.stdout)
+            self.assertIn("ok", env)
 
 
 if __name__ == "__main__":

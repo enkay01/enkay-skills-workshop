@@ -77,23 +77,56 @@ observation identity survive between commands.
 
 ## Known limitations
 
-**Some applications mangle injected text.** `act type` dispatches one
-`KEYEVENTF_UNICODE` key-down/key-up pair per UTF-16 code unit and reports
-exactly what it injected. The engine's delivery is correct — it has been
-verified against a classic WinForms text box, where accented and non-Latin
-text arrives intact — but an application that routes keystrokes through a TSF
-text service can still drop or substitute characters after they reach it. The
-modern Windows 11 Notepad does this reproducibly: injecting
-`wcu typed this sentence.` yields `wcu ........` while `events_injected`
-reports the full 24 characters. No amount of per-character delay, chunking,
-or input batching changes it, because the loss happens in the receiving
-application rather than in the dispatch.
+**Some applications mangle injected Unicode events.** The default `act type`
+method uses `KEYEVENTF_UNICODE`. Modern Windows 11 Notepad has reproducibly
+corrupted this input despite accepting every event. Delay and batching changes
+did not resolve it. Per `docs/windows-text-input-apis.md`, delivery through
+`WM_CHAR` is verbatim and no Win32-layer coalescing is documented; the rewrite
+happens downstream in the TSF composition/correction layer, which is why only
+committed-text insertion is robust there.
 
-Treat a green `status: "typed"` as proof of dispatch, not of what the
-application recorded. After typing into an unfamiliar target, read the result
-back — `inspect` for an accessible value, or `observe` and look at the frame —
-before reporting success. If the text is mangled, prefer a target whose text
-entry is verified over repeating the same call.
+Use verified message delivery for this target:
+
+```bash
+wcu act type --method commit --text "wcu typed this sentence."
+```
+
+Commit sends one synchronous, undoable `EM_REPLACESEL` message to the focused
+editor's own window (bounded by `SendMessageTimeoutW`), then checks the
+expected replacement for up to two seconds. `verification: "matched"`
+confirms the result; `text_mismatch` is an error. It touches neither the
+clipboard (`clipboard: "unchanged"`) nor the input stream
+(`events_injected: 0`, `messages_sent: 1`). Unicode mode reports
+`verification: "unavailable"`; `typed` alone only confirms dispatch.
+Dry runs dispatch nothing.
+
+Commit requires a focused editor with one selection or caret and documents up
+to 65536 UTF-16 units. It refuses NUL, `--delay-ms`, read-only targets, and
+editors it cannot read back. Editors without TextPattern can only verify
+insertion into an empty document. There is no automatic retry or fallback:
+after a mismatch the single message was applied atomically or not at all,
+so inspect the editor before acting again.
+
+Clipboard delivery remains the fallback when an editor ignores edit messages:
+
+```bash
+wcu act type --method paste --text "wcu typed this sentence."
+```
+
+Paste uses `CF_UNICODETEXT` and virtual-key Ctrl+V. It reads the focused editor's
+full text and selection, then checks the expected replacement for up to two
+seconds. `verification: "matched"` confirms the result; `text_mismatch` is an
+error. Unicode mode reports `verification: "unavailable"`; `typed` alone only
+confirms dispatch. Dry runs do not inspect text or touch the clipboard.
+
+Paste requires UIA TextPattern with one selection or caret and documents up to
+65536 UTF-16 units. It refuses unsupported editors, NUL, `--delay-ms`, held
+modifiers, and clipboard formats other than plain text and locale before
+dispatch. Existing plain-text clipboard formats are restored after a confirmed
+paste, unless another process changed the clipboard. Check the returned
+`clipboard` field. After ambiguous delivery, verification failure, or cancellation,
+staged text may remain on the clipboard so a late consumer cannot paste the old
+contents. There is no automatic retry or fallback.
 
 **Foreground is a real constraint.** Guarded actions refuse unless the
 attached window is the foreground window, so they return `foreground_changed`

@@ -359,6 +359,7 @@ class SessionServer:
                 observation_id=obs_id,
                 max_age_ms=max_age,
                 delay_ms=args.get("delay_ms"),
+                method=str(args.get("method", "unicode")),
                 dry_run=dry_run,
             )
         if action == "press":

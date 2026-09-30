@@ -58,11 +58,22 @@ bounds from the observation.
   hit-test before dispatching. A changed target returns `refused` with new
   evidence — reconsider, never replay the old target.
 - Add `--dry-run` to validate a proposal without dispatching input.
-- `status: "typed"` proves dispatch, not what the application recorded. Read
-  text back after typing — `inspect` for an accessible value, or `observe` and
-  look at the frame. Some applications mangle injected text regardless of how
-  it is batched; repeating the same call will not fix it. See the CLI README's
-  "Known limitations".
+- Use `act type --method commit --text "..."` for text editors, including
+  modern Notepad. Commit sends one undoable edit message to the focused
+  editor and confirms by reading the document back
+  (`verification: "matched"`). It touches neither the clipboard nor the
+  input stream. It needs a focused editor with one selection or caret and
+  documents up to 65536 UTF-16 units; editors without TextPattern can only
+  verify insertion into an empty document. See the CLI README's
+  "Known limitations" for the exact preconditions.
+- `act type --method paste --text "..."` is the fallback when the editor
+  ignores edit messages. Paste reads the focused editor's full text and
+  selection and confirms the expected result. It preserves a plain-text
+  clipboard; other clipboard formats or unreadable editor selections are
+  refused before dispatch. Check the returned `clipboard` field.
+- The default Unicode method reports `verification: "unavailable"`. Read text
+  back with `inspect` or `observe` before reporting success. A `typed` status
+  alone proves dispatch. Repeating corrupted input can duplicate content.
 - `inspect` answers a named-control or region question when the screenshot is
   ambiguous. It is not a routine confidence check after visual identification.
 
@@ -90,8 +101,9 @@ in the result envelope. Common codes: `no_session` (run `session start`),
 `engine_not_found` (build the engine), `foreground_changed` (the target is not
 in front — `switch` to it), `stale_observation` (re-observe and act promptly).
 
-A `typed` result with garbled text in the target is not a refusal and carries
-no error code — the input was dispatched and the application discarded or
-substituted it. Modern Windows 11 Notepad does this reproducibly with injected
-keystrokes. Switch to a target whose text entry is verified rather than
-retrying.
+For corrupted Unicode typing, inspect the editor before making another edit.
+Use explicit commit mode for subsequent text entry. A commit `text_mismatch`
+means the expected document was not confirmed; check the editor before acting
+again. A paste `text_mismatch` means the same; additionally check the clipboard
+outcome. An unsupported verification or clipboard error before
+dispatch leaves editor content unchanged.
