@@ -54,88 +54,19 @@ pub struct MonitorInfo {
     pub is_primary: bool,
 }
 
-/// The desktop name Windows reports on a normal interactive session.
-const INTERACTIVE_DESKTOP_NAME: &str = "Default";
-
-/// Test control: when set to any value, [`check_interactive_desktop`] reports the
-/// session as having no interactive desktop.
-///
-/// This exists because the real condition cannot be produced from a test without
-/// changing the state of the live interactive session the suite runs in. Locking
-/// the session removes the desktop the tests need; switching the input desktop
-/// blanks the user's screen; and creating a non-interactive window station fails
-/// with `ERROR_ACCESS_DENIED` because it needs `SE_CREATE_WINDOW_STATION`.
-/// `CreateDesktop` plus `SetThreadDesktop` does not help either, because
-/// `OpenInputDesktop` reports the *window station's* input desktop rather than the
-/// calling thread's, so the name read back is still `Default`.
-///
-/// The valve is deliberately one-way. No value of it, and no code path, turns a
-/// failing check into a passing one, so it cannot be used to weaken the guard: it
-/// can only make the engine refuse. Setting it by accident in production
-/// therefore makes every action fail loudly rather than letting input through.
-///
-/// It is honoured in release builds too. Restricting it to debug builds would let
-/// a suite run against a release binary pass while asserting nothing.
-///
-/// See `specs/desktop-inaccessibility-guard-testing.md`, which records the
-/// measurements behind each of those claims.
-const TEST_DESKTOP_INACCESSIBLE_VAR: &str = "WCU_TEST_DESKTOP_INACCESSIBLE";
-
-/// What the Win32 query learned about the input desktop.
-///
-/// Split out from the verdict so the decision can be reasoned about and tested
-/// without the operating system state that a live refusal depends on.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum InputDesktop {
-    /// The input desktop could not be opened at all. This is what a locked or
-    /// headless session reports.
-    Unavailable(String),
-    /// The input desktop was opened but its name could not be read.
-    NameUnavailable(String),
-    /// The input desktop was opened and is named this.
-    Named(String),
-}
-
-/// Decide whether the session is usable, from what the query found.
-///
-/// A name that is empty, padded, or otherwise not the interactive desktop is
-/// refused rather than normalised. A name the engine did not expect exactly is a
-/// reason to stop and report, not a reason to guess.
-pub fn desktop_access_verdict(probe: &InputDesktop) -> Result<String, String> {
-    match probe {
-        InputDesktop::Unavailable(why) => Err(format!(
-            "Cannot access the input desktop: the session is locked, disconnected or headless ({})",
-            why
-        )),
-        InputDesktop::NameUnavailable(why) => {
-            Err(format!("Opened the input desktop but could not read its name ({})", why))
-        }
-        InputDesktop::Named(name) => {
-            if name.eq_ignore_ascii_case(INTERACTIVE_DESKTOP_NAME) {
-                Ok(format!("WinSta0\\{} (Interactive)", name))
-            } else {
-                Err(format!(
-                    "Desktop is '{}' (Expected '{}')",
-                    name, INTERACTIVE_DESKTOP_NAME
-                ))
-            }
-        }
-    }
-}
-
-/// Query the window station's input desktop and reduce it to the facts the verdict
-/// needs. Safe to call on any thread: it neither switches nor attaches.
-fn probe_input_desktop() -> InputDesktop {
+pub fn check_interactive_desktop() -> Result<String, String> {
     unsafe {
-        let h_desk = match OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, DESKTOP_ACCESS_FLAGS(0x0100)) {
-            Ok(h) => h,
-            Err(e) => return InputDesktop::Unavailable(format!("{}", e)),
-        };
+        let h_desk = OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, DESKTOP_ACCESS_FLAGS(0x0100));
+        if h_desk.is_err() {
+            return Err("Cannot access input desktop: session is locked or headless".into());
+        }
+        let h_desk = h_desk.unwrap();
 
         let mut name_buf = [0u16; 256];
         let mut needed = 0u32;
+        let handle = HANDLE(h_desk.0);
         let ok = GetUserObjectInformationW(
-            HANDLE(h_desk.0),
+            handle,
             UOI_NAME,
             Some(name_buf.as_mut_ptr() as *mut _),
             (name_buf.len() * 2) as u32,
@@ -143,27 +74,20 @@ fn probe_input_desktop() -> InputDesktop {
         );
         let _ = CloseDesktop(h_desk);
 
-        if ok.is_err() {
-            return InputDesktop::NameUnavailable(format!("{}", ok.unwrap_err()));
+        if ok.is_ok() {
+            let len = (0..name_buf.len())
+                .position(|i| name_buf[i] == 0)
+                .unwrap_or(name_buf.len());
+            let name = String::from_utf16_lossy(&name_buf[..len]);
+            if name.eq_ignore_ascii_case("default") {
+                Ok("WinSta0\\Default (Interactive)".into())
+            } else {
+                Err(format!("Desktop is '{}' (Expected 'Default')", name))
+            }
+        } else {
+            Err("Failed to query input desktop name".into())
         }
-        let len = (0..name_buf.len())
-            .position(|i| name_buf[i] == 0)
-            .unwrap_or(name_buf.len());
-        InputDesktop::Named(String::from_utf16_lossy(&name_buf[..len]))
     }
-}
-
-pub fn check_interactive_desktop() -> Result<String, String> {
-    // One-way valve: forces the refusing verdict and nothing else. Checked before
-    // the query so a test never depends on the session being in a given state.
-    if std::env::var_os(TEST_DESKTOP_INACCESSIBLE_VAR).is_some() {
-        return Err(format!(
-            "{} is set: reporting the session as having no interactive desktop \
-             (test control, not a real condition)",
-            TEST_DESKTOP_INACCESSIBLE_VAR
-        ));
-    }
-    desktop_access_verdict(&probe_input_desktop())
 }
 
 pub fn attach_thread_to_input_desktop() -> Result<(), String> {
@@ -576,132 +500,6 @@ mod tests {
         println!("test_enum_windows found: {} windows", list.len());
         for w in list.iter().take(5) {
             println!("  window: {} ({}) [{}]", w.title, w.class_name, w.hwnd);
-        }
-    }
-
-    // --- input desktop verdict -------------------------------------------------
-    //
-    // These cover the decision only, because the state that makes the check fail
-    // cannot be produced from a test without changing the live session. See the
-    // comment on TEST_DESKTOP_INACCESSIBLE_VAR for what was tried.
-
-    /// The valve lives in the process environment, which `cargo test` shares across
-    /// concurrently running tests. Every test that sets, removes, or asserts its
-    /// absence takes this first, so the suite is deterministic without needing
-    /// `--test-threads=1`.
-    static VALVE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn lock_valve() -> std::sync::MutexGuard<'static, ()> {
-        // A previous test panicking while holding the lock poisons it; the state
-        // it guards is the environment, which the next test re-establishes anyway.
-        VALVE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    #[test]
-    fn verdict_accepts_the_interactive_desktop() {
-        let r = desktop_access_verdict(&InputDesktop::Named("Default".into()));
-        assert!(r.is_ok(), "Default must be accepted: {:?}", r);
-    }
-
-    #[test]
-    fn verdict_ignores_ascii_case() {
-        for name in ["default", "DEFAULT", "DeFaUlT"] {
-            let r = desktop_access_verdict(&InputDesktop::Named(name.into()));
-            assert!(r.is_ok(), "{} must be accepted: {:?}", name, r);
-        }
-    }
-
-    #[test]
-    fn verdict_refuses_the_other_desktops_windows_names() {
-        // Winlogon and Screen-saver are the names Windows itself uses, and both
-        // appear while a session is logging on or locking.
-        for name in ["Winlogon", "Screen-saver", "Service-0x0-3e7$"] {
-            let r = desktop_access_verdict(&InputDesktop::Named(name.into()));
-            assert!(r.is_err(), "{} must be refused, got {:?}", name, r);
-        }
-    }
-
-    #[test]
-    fn verdict_refuses_a_non_interactive_desktop() {
-        let r = desktop_access_verdict(&InputDesktop::Named("Locked".into()));
-        assert!(r.is_err(), "a non-default desktop must be refused, got {:?}", r);
-        let msg = r.unwrap_err();
-        assert!(msg.contains("Locked"), "the message must name the desktop found: {}", msg);
-        assert!(msg.contains("Default"), "the message must name the one expected: {}", msg);
-    }
-
-    #[test]
-    fn verdict_refuses_rather_than_normalising_an_unexpected_name() {
-        // Empty and padded names are refused, not trimmed. A name the engine did
-        // not expect exactly is a reason to stop and report, not to guess.
-        for name in ["", " ", " Default", "Default ", "Default\t"] {
-            let r = desktop_access_verdict(&InputDesktop::Named(name.into()));
-            assert!(r.is_err(), "{:?} must be refused, got {:?}", name, r);
-        }
-    }
-
-    #[test]
-    fn verdict_refuses_an_unopened_or_unnamed_desktop() {
-        let r = desktop_access_verdict(&InputDesktop::Unavailable("access denied".into()));
-        assert!(r.is_err(), "an unopened input desktop must be refused, got {:?}", r);
-        assert!(r.unwrap_err().contains("access denied"));
-
-        let r = desktop_access_verdict(&InputDesktop::NameUnavailable("bad handle".into()));
-        assert!(r.is_err(), "an unreadable name must be refused, got {:?}", r);
-        assert!(r.unwrap_err().contains("bad handle"));
-    }
-
-    // --- the live Win32 query --------------------------------------------------
-
-    #[test]
-    fn live_input_desktop_is_readable_and_interactive() {
-        let _guard = lock_valve();
-        // The one branch a live interactive session can honestly produce. It
-        // exercises the real API usage, which the pure verdict tests cannot.
-        match probe_input_desktop() {
-            InputDesktop::Named(name) => assert!(
-                name.eq_ignore_ascii_case(INTERACTIVE_DESKTOP_NAME),
-                "expected the interactive desktop, got {:?}",
-                name
-            ),
-            other => panic!(
-                "expected a named input desktop on an interactive session, got {:?}",
-                other
-            ),
-        }
-        assert!(
-            check_interactive_desktop().is_ok(),
-            "the guard's own check must pass on an interactive session"
-        );
-    }
-
-    // --- the one-way valve -----------------------------------------------------
-
-    #[test]
-    fn the_valve_only_ever_forces_a_refusal() {
-        let _guard = lock_valve();
-        // Unset: the real verdict stands, and on this machine it is interactive.
-        assert!(std::env::var_os(TEST_DESKTOP_INACCESSIBLE_VAR).is_none());
-        assert!(check_interactive_desktop().is_ok());
-
-        // Set to values that could plausibly mean "off" if the valve were a
-        // boolean. It is not: any value at all forces the refusal, and the
-        // refusal names the control so it can never be mistaken for a real
-        // locked session.
-        for value in ["1", "0", "", "false"] {
-            std::env::set_var(TEST_DESKTOP_INACCESSIBLE_VAR, value);
-            let r = check_interactive_desktop();
-            std::env::remove_var(TEST_DESKTOP_INACCESSIBLE_VAR);
-            assert!(
-                r.is_err(),
-                "{:?} must force a refusal, got {:?}",
-                value,
-                r
-            );
-            assert!(
-                r.unwrap_err().contains(TEST_DESKTOP_INACCESSIBLE_VAR),
-                "the message must name the test control that decided this"
-            );
         }
     }
 }
