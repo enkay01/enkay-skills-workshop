@@ -12,6 +12,7 @@ from __future__ import annotations
 import ctypes
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -120,6 +121,33 @@ def _server_env() -> Dict[str, str]:
     return env
 
 
+def _resolve_interpreter() -> str:
+    """Return a path that is actually a Python interpreter.
+
+    ``sys.executable`` is only reliable when the caller is python itself.
+    A pip ``console_scripts`` shim runs this module inside ``wcu.exe``, where
+    ``sys.executable`` is that exe; passing it back to ``subprocess`` with
+    ``-m`` starts no interpreter. Walk up from the shim to the real
+    interpreter, and fall back to a PATH lookup.
+    """
+    candidate = sys.executable
+    base = os.path.basename(candidate).lower()
+    if base.startswith("python"):
+        return candidate
+    # Scripts\wcu.exe -> <prefix>\python.exe
+    sibling = Path(candidate).resolve().parent.parent / "python.exe"
+    if sibling.exists():
+        return str(sibling)
+    found = shutil.which("python") or shutil.which("python3")
+    if found:
+        return found
+    raise SessionError(
+        "interpreter_not_found",
+        f"Could not find a Python interpreter to start the session server "
+        f"(sys.executable was '{sys.executable}')",
+    )
+
+
 def _start_lock_path() -> Path:
     return wcu_home() / "session.lock"
 
@@ -196,9 +224,16 @@ def _start_session_locked(engine_path: Optional[Path]) -> Dict[str, Any]:
     sdir.mkdir(parents=True, exist_ok=True)
     log_path = sdir / "server.log"
 
+    # `sys.executable` is the interpreter only when this module is imported by
+    # python. Under a pip console_scripts wrapper it resolves to `wcu.exe`,
+    # and spawning that with `-m` starts no interpreter at all: the child
+    # exits immediately and the session never comes up. Resolve a real
+    # interpreter explicitly rather than trusting sys.executable.
+    python_exe = _resolve_interpreter()
+
     proc = subprocess.Popen(
         [
-            sys.executable,
+            python_exe,
             "-m",
             "wcu.session_server",
             "--session-id",
@@ -209,7 +244,12 @@ def _start_session_locked(engine_path: Optional[Path]) -> Dict[str, Any]:
         env=_server_env(),
         stdout=open(log_path, "wb"),
         stderr=subprocess.STDOUT,
-        creationflags=getattr(subprocess, "DETACHED_PROCESS", 0)
+        # CREATE_NO_WINDOW, not just DETACHED_PROCESS: DETACHED_PROCESS
+        # detaches from the console but a console-subsystem child can still
+        # allocate a window, which flashes over the desktop this tool is
+        # about to screenshot.
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        | getattr(subprocess, "DETACHED_PROCESS", 0)
         | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
         close_fds=True,
     )

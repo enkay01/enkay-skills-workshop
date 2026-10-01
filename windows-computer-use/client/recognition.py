@@ -125,6 +125,80 @@ class OcrRecognizer:
         # Convert to BGR (standard for OpenCV and RapidOCR)
         return cv2.cvtColor(bgra, cv2.COLOR_BGRA2BGR)
 
+    def recognize_raw(
+        self,
+        image: np.ndarray,
+        region: Optional[Tuple[int, int, int, int]] = None,
+        min_confidence: float = 0.0,
+    ) -> List[TargetBox]:
+        """Run the RapidOCR engine and return raw boxes in full-frame pixels.
+
+        Unlike :meth:`recognize`, this applies no profile gate. It is the
+        general grounding path: every box the engine reads is returned, so a
+        caller can match its own text without declaring a profile first.
+
+        Args:
+            image: Full BGR frame.
+            region: Optional (x, y, w, h) crop, clamped to image bounds.
+                Raises ValueError when the region is empty or lies fully
+                outside the image.
+            min_confidence: Boxes below this confidence are dropped.
+
+        Returns:
+            TargetBox list sorted by confidence descending.
+        """
+        if region is None:
+            origin_x, origin_y = 0, 0
+            crop = image
+        else:
+            origin_x, origin_y, crop = self._clamp_region(image, region)
+
+        ocr_res, _ = self._engine(crop)
+        boxes: List[TargetBox] = []
+        if not ocr_res:
+            return boxes
+        for item in ocr_res:
+            poly_crop, text, conf = item
+            if float(conf) < min_confidence:
+                continue
+            poly_full = [
+                [float(pt[0] + origin_x), float(pt[1] + origin_y)]
+                for pt in poly_crop
+            ]
+            xs = [pt[0] for pt in poly_full]
+            ys = [pt[1] for pt in poly_full]
+            bx = int(round(min(xs)))
+            by = int(round(min(ys)))
+            bw = int(round(max(xs) - min(xs)))
+            bh = int(round(max(ys) - min(ys)))
+            boxes.append(
+                TargetBox(
+                    label=text.strip(),
+                    bbox=(bx, by, bw, bh),
+                    polygon=poly_full,
+                    confidence=float(conf),
+                )
+            )
+        boxes.sort(key=lambda b: b.confidence, reverse=True)
+        return boxes
+
+    @staticmethod
+    def _clamp_region(
+        image: np.ndarray, region: Tuple[int, int, int, int]
+    ) -> Tuple[int, int, np.ndarray]:
+        """Clamp (x, y, w, h) to image bounds; return (origin_x, origin_y, crop)."""
+        img_h, img_w = image.shape[:2]
+        x, y, w, h = (int(v) for v in region)
+        if w <= 0 or h <= 0:
+            raise ValueError(f"Empty region: {(x, y, w, h)}")
+        x1 = max(0, x)
+        y1 = max(0, y)
+        x2 = min(img_w, x + w)
+        y2 = min(img_h, y + h)
+        if x2 <= x1 or y2 <= y1:
+            raise ValueError(f"Region outside image bounds: {(x, y, w, h)}")
+        return x1, y1, image[y1:y2, x1:x2]
+
     def recognize(self, image: np.ndarray, profile: Profile) -> RecognitionOutcome:
         """Recognize actionable targets or stop conditions according to a profile.
         

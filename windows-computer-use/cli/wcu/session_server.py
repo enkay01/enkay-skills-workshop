@@ -21,7 +21,7 @@ import time
 import traceback
 import uuid
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 # Make the repo's client package importable (repo layout: cli/wcu -> ../..).
 from wcu.paths import (
@@ -41,6 +41,7 @@ from wcu_client import WcuClient, WcuError  # noqa: E402
 
 from wcu import ipc  # noqa: E402
 from wcu.constants import REFUSAL_CODES  # noqa: E402
+from wcu.grounding import clamp_region, find_color, match_template  # noqa: E402
 from wcu.history import History  # noqa: E402
 from wcu.imaging import save_observation_png  # noqa: E402
 
@@ -100,6 +101,10 @@ class SessionServer:
         self.in_flight = False
         self._shutdown = False
         self._op_lock = threading.Lock()
+        # Observation PNGs this session has written, so a grounding call can
+        # be pointed at an explicit id or at simply "the latest".
+        self._observation_paths: Dict[int, Path] = {}
+        self._last_observation_path: Optional[Path] = None
 
     # ------------------------------------------------------------------
     # Engine lifecycle
@@ -127,16 +132,64 @@ class SessionServer:
     # Observation helpers
     # ------------------------------------------------------------------
 
-    def _observe_and_save(self, monitor: bool = False) -> Dict[str, Any]:
+    def _observe_and_save(
+        self,
+        monitor: bool = False,
+        crop: Optional[Sequence[int]] = None,
+    ) -> Dict[str, Any]:
         client = self.ensure_engine()
         if monitor:
             meta, payload = client.observe_monitor()
         else:
             meta, payload = client.observe()
-        path = save_observation_png(shots_dir(self.session_id), meta, payload)
+        width = int(meta["width"])
+        height = int(meta["height"])
+        crop_offset = [0, 0]
+        crop_size: Optional[Tuple[int, int]] = None
+        if crop is not None:
+            cx, cy, cw, ch = clamp_region(width, height, crop)
+            crop_offset = [cx, cy]
+            crop_size = (cw, ch)
+
+        path = save_observation_png(
+            shots_dir(self.session_id), meta, payload, crop=crop
+        )
         meta = dict(meta)
         meta["image_path"] = str(path)
+        meta["crop_offset"] = crop_offset
+        if crop_size is not None:
+            meta["full_width"] = width
+            meta["full_height"] = height
+            meta["width"] = crop_size[0]
+            meta["height"] = crop_size[1]
+        self._observation_paths[int(meta.get("observation_id", 0))] = path
+        self._last_observation_path = path
         return meta
+
+    def _read_observation(
+        self, args: Dict[str, Any]
+    ) -> Tuple[Path, Optional[int]]:
+        """Resolve the PNG a grounding call should read.
+
+        An explicit ``observation_id`` wins. Otherwise the most recent
+        observation is used, so ``wcu ocr`` straight after ``wcu observe``
+        needs no id plumbing.
+        """
+        obs_id = args.get("observation_id")
+        if obs_id is not None:
+            obs_id = int(obs_id)
+            path = self._observation_paths.get(obs_id)
+            if path is None or not path.exists():
+                raise WcuError(
+                    "no_observation",
+                    f"No stored observation {obs_id}; run `wcu observe` first",
+                )
+            return path, obs_id
+        if self._last_observation_path is None:
+            raise WcuError(
+                "no_observation", "No observation available; run `wcu observe`"
+            )
+        return self._last_observation_path, None
 
     def _find_window(self, hwnd: str) -> Dict[str, Any]:
         client = self.ensure_engine()
@@ -227,7 +280,224 @@ class SessionServer:
         }
 
     def op_observe(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        return self._observe_and_save(monitor=bool(args.get("monitor")))
+        return self._observe_and_save(
+            monitor=bool(args.get("monitor")), crop=args.get("crop")
+        )
+
+    def op_ocr(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Text-target grounding over a stored observation PNG."""
+        import cv2
+
+        path, _obs_id = self._read_observation(args)
+        image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+        if image is None:
+            raise WcuError(
+                "no_observation", f"Cannot read observation image: {path}"
+            )
+        img_h, img_w = image.shape[:2]
+        region = args.get("region")
+        clamped: Optional[Tuple[int, int, int, int]] = None
+        if region is not None:
+            try:
+                clamped = clamp_region(img_w, img_h, region)
+            except ValueError as e:
+                raise WcuError("invalid_region", str(e)) from e
+
+        try:
+            from recognition import OcrRecognizer  # client dir on sys.path
+        except Exception as e:  # noqa: BLE001
+            raise WcuError(
+                "ocr_unavailable",
+                "OCR engine could not be imported: " f"{type(e).__name__}: {e}",
+            ) from e
+
+        started = time.perf_counter()
+        try:
+            boxes = OcrRecognizer.get_instance().recognize_raw(
+                image,
+                region=list(clamped) if clamped else None,
+                min_confidence=float(args.get("min_confidence", 0.0)),
+            )
+        except WcuError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            raise WcuError(
+                "ocr_failed", f"{type(e).__name__}: {e}"
+            ) from e
+        latency_ms = (time.perf_counter() - started) * 1000.0
+
+        matches: List[Dict[str, Any]] = [
+            {
+                "text": box.label,
+                "bbox": list(box.bbox),
+                "confidence": float(box.confidence),
+            }
+            for box in boxes
+        ]
+
+        want = args.get("match")
+        best: Optional[Dict[str, Any]] = None
+        if want:
+            needle = str(want).strip().lower()
+            for m in matches:
+                if needle in str(m["text"]).strip().lower():
+                    if best is None or m["confidence"] > best["confidence"]:
+                        best = m
+
+        result: Dict[str, Any] = {
+            "matches": matches,
+            "count": len(matches),
+            "latency_ms": round(latency_ms, 1),
+            "image_path": str(path),
+            "region": list(clamped) if clamped else None,
+        }
+        if want:
+            result["matched"] = best
+        return result
+
+    def op_find(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Template or colour grounding over a stored observation PNG."""
+        import cv2
+
+        path, _obs_id = self._read_observation(args)
+        image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+        if image is None:
+            raise WcuError(
+                "no_observation", f"Cannot read observation image: {path}"
+            )
+        img_h, img_w = image.shape[:2]
+        region = args.get("region")
+        clamped: Optional[Tuple[int, int, int, int]] = None
+        if region is not None:
+            try:
+                clamped = clamp_region(img_w, img_h, region)
+            except ValueError as e:
+                raise WcuError("invalid_region", str(e)) from e
+
+        template_path = args.get("template_path")
+        color = args.get("color")
+        if not template_path and not color:
+            raise WcuError(
+                "invalid_request",
+                "At least one of 'template_path' or 'color' is required",
+            )
+
+        found: List[Dict[str, Any]] = []
+        if template_path:
+            template = cv2.imread(str(template_path), cv2.IMREAD_COLOR)
+            if template is None:
+                raise WcuError(
+                    "template_not_found",
+                    f"Cannot read template image: {template_path}",
+                )
+            try:
+                found = match_template(
+                    image,
+                    template,
+                    region=list(clamped) if clamped else None,
+                    threshold=float(args.get("threshold", 0.8)),
+                )
+            except ValueError as e:
+                raise WcuError("find_failed", str(e)) from e
+        else:
+            try:
+                found = find_color(
+                    image,
+                    str(color),
+                    tolerance=int(args.get("tolerance", 30)),
+                    region=list(clamped) if clamped else None,
+                    min_area=int(args.get("min_area", 25)),
+                )
+            except ValueError as e:
+                raise WcuError("find_failed", str(e)) from e
+
+        return {
+            "matches": found,
+            "count": len(found),
+            "image_path": str(path),
+            "region": list(clamped) if clamped else None,
+        }
+
+    def op_launch(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Start a process or URI, optionally waiting for a matching window."""
+        import os as _os
+        import subprocess
+
+        target = str(args.get("target", "")).strip()
+        if not target:
+            raise WcuError("invalid_request", "launch needs a target")
+
+        argv = [str(a) for a in (args.get("args") or [])]
+        timeout_ms = int(args.get("timeout_ms", 0))
+        want_title = args.get("window_title")
+        want_title_lower = str(want_title).lower() if want_title else None
+        client = self.ensure_engine()
+
+        if _os.name == "nt" and "://" in target:
+            # URI or shell verb: hand it to the shell rather than CreateProcess.
+            _os.startfile(target)  # noqa: S606
+            pid = None
+        else:
+            # No console window: the caller is usually an agent, and a
+            # flashing console over the desktop is both noise and a
+            # foreground-steal risk for the very next action.
+            flags = 0
+            for _name in (
+                "CREATE_NO_WINDOW",
+                "CREATE_NEW_PROCESS_GROUP",
+                "DETACHED_PROCESS",
+            ):
+                flags |= getattr(subprocess, _name, 0)
+            try:
+                proc = subprocess.Popen(
+                    [target, *argv],
+                    creationflags=flags,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except FileNotFoundError as e:
+                raise WcuError(
+                    "launch_failed", f"Program not found: {target}"
+                ) from e
+            except OSError as e:
+                raise WcuError(
+                    "launch_failed", f"Could not launch {target}: {e}"
+                ) from e
+            pid = proc.pid
+
+        waited_for: Optional[str] = None
+        if timeout_ms > 0:
+            deadline = time.monotonic() + timeout_ms / 1000.0
+            while time.monotonic() < deadline:
+                try:
+                    for w in client.list_windows():
+                        if not w.get("is_visible"):
+                            continue
+                        title = str(w.get("title", ""))
+                        if want_title_lower is None:
+                            matched = bool(title)
+                        else:
+                            matched = want_title_lower in title.lower()
+                        if matched:
+                            waited_for = title
+                            break
+                except WcuError:
+                    pass
+                if waited_for is not None:
+                    break
+                time.sleep(0.25)
+
+        result: Dict[str, Any] = {
+            "status": "launched",
+            "target": target,
+            "pid": pid,
+        }
+        if timeout_ms > 0:
+            result["window_found"] = waited_for is not None
+            result["window_title"] = waited_for
+            result["timed_out"] = waited_for is None
+        return result
 
     def op_inspect(self, args: Dict[str, Any]) -> Dict[str, Any]:
         client = self.ensure_engine()

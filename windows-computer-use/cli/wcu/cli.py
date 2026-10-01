@@ -90,7 +90,7 @@ Core loop (one session, many commands):
   wcu session start                 start the persistent desktop session
   wcu windows [--filter TEXT]       list visible windows
   wcu attach <hwnd>                 attach capture to a window
-  wcu observe                       capture a screenshot (PNG on disk)
+  wcu observe [--crop X,Y,W,H]       capture a screenshot (PNG on disk)
   wcu act click --observation-id N --point X,Y   dispatch a guarded action
   wcu session status                session, engine, and target state
   wcu session stop                  stop the session and clean up
@@ -100,6 +100,11 @@ Discovery and inspection:
   wcu monitors                      list display monitors
   wcu inspect [--question TEXT]     bounded accessibility inspection
   wcu history                       bounded operation history (no typed text)
+
+Grounding (prefer these over estimating pixels from a full screenshot):
+  wcu ocr [--region X,Y,W,H] [--match TEXT]   text-target grounding
+  wcu find (--template PATH | --color #RRGGBB) icon/colour grounding
+  wcu launch <target> [--window-title TEXT]   start a program or URI
 
 Window control:
   wcu focus <hwnd>                  focus a window (verified)
@@ -242,8 +247,71 @@ def cmd_switch(args: argparse.Namespace) -> int:
 
 
 def cmd_observe(args: argparse.Namespace) -> int:
+    payload: Dict[str, Any] = {"monitor": args.monitor}
+    if args.crop:
+        payload["crop"] = list(args.crop)
     try:
-        resp = sess.session_call("observe", {"monitor": args.monitor}, timeout_sec=15.0)
+        resp = sess.session_call("observe", payload, timeout_sec=15.0)
+    except sess.SessionError as e:
+        return _handle_session_error(e)
+    except PipeError as e:
+        return _handle_pipe_error(e)
+    if not resp.get("ok"):
+        return _emit(_error_env(_session_id(), resp["error"]["code"], resp["error"]["message"], resp["error"].get("details")))
+    return _emit(_envelope(_session_id(), True, "ok", result=resp["result"]))
+
+
+def cmd_ocr(args: argparse.Namespace) -> int:
+    payload: Dict[str, Any] = {"match": args.match}
+    if args.obs is not None:
+        payload["observation_id"] = args.obs
+    if args.region:
+        payload["region"] = list(args.region)
+    if args.min_confidence:
+        payload["min_confidence"] = args.min_confidence
+    try:
+        resp = sess.session_call("ocr", payload, timeout_sec=60.0)
+    except sess.SessionError as e:
+        return _handle_session_error(e)
+    except PipeError as e:
+        return _handle_pipe_error(e)
+    if not resp.get("ok"):
+        return _emit(_error_env(_session_id(), resp["error"]["code"], resp["error"]["message"], resp["error"].get("details")))
+    return _emit(_envelope(_session_id(), True, "ok", result=resp["result"]))
+
+
+def cmd_find(args: argparse.Namespace) -> int:
+    payload: Dict[str, Any] = {}
+    if args.template:
+        payload["template_path"] = args.template
+    if args.color:
+        payload["color"] = args.color
+    if args.obs is not None:
+        payload["observation_id"] = args.obs
+    if args.region:
+        payload["region"] = list(args.region)
+    if args.threshold is not None:
+        payload["threshold"] = args.threshold
+    if args.tolerance is not None:
+        payload["tolerance"] = args.tolerance
+    try:
+        resp = sess.session_call("find", payload, timeout_sec=60.0)
+    except sess.SessionError as e:
+        return _handle_session_error(e)
+    except PipeError as e:
+        return _handle_pipe_error(e)
+    if not resp.get("ok"):
+        return _emit(_error_env(_session_id(), resp["error"]["code"], resp["error"]["message"], resp["error"].get("details")))
+    return _emit(_envelope(_session_id(), True, "ok", result=resp["result"]))
+
+
+def cmd_launch(args: argparse.Namespace) -> int:
+    payload: Dict[str, Any] = {"target": args.target, "args": list(args.args or [])}
+    if args.window_title:
+        payload["window_title"] = args.window_title
+        payload["timeout_ms"] = int(args.timeout * 1000)
+    try:
+        resp = sess.session_call("launch", payload, timeout_sec=args.timeout + 30.0)
     except sess.SessionError as e:
         return _handle_session_error(e)
     except PipeError as e:
@@ -434,7 +502,41 @@ def build_parser() -> argparse.ArgumentParser:
     p_observe = sub.add_parser("observe", help="capture a screenshot (PNG on disk)")
     p_observe.add_argument("--monitor", action="store_true",
                            help="capture the primary monitor instead of the attached window")
+    p_observe.add_argument("--crop", nargs=4, type=int, metavar=("X", "Y", "W", "H"),
+                           help="write only this region at native resolution; the observation carries crop_offset")
     p_observe.set_defaults(func=cmd_observe)
+
+    p_ocr = sub.add_parser("ocr", help="text-target grounding over the last observation")
+    p_ocr.add_argument("--obs", type=int, default=None,
+                       help="observation id (default: the most recent)")
+    p_ocr.add_argument("--region", nargs=4, type=int, metavar=("X", "Y", "W", "H"),
+                       help="OCR only inside this region, in observation pixels")
+    p_ocr.add_argument("--match", default=None,
+                       help="substring to look for; the best hit is returned as 'matched'")
+    p_ocr.add_argument("--min-confidence", type=float, default=0.0)
+    p_ocr.set_defaults(func=cmd_ocr)
+
+    p_find = sub.add_parser("find", help="template or colour grounding over the last observation")
+    p_find.add_argument("--template", default=None,
+                        help="path to a reference image supplied at runtime")
+    p_find.add_argument("--color", default=None,
+                        help="target colour as #RRGGBB")
+    p_find.add_argument("--obs", type=int, default=None)
+    p_find.add_argument("--region", nargs=4, type=int, metavar=("X", "Y", "W", "H"))
+    p_find.add_argument("--threshold", type=float, default=None,
+                        help="template match confidence floor (default 0.8)")
+    p_find.add_argument("--tolerance", type=int, default=None,
+                        help="per-channel colour tolerance (default 30)")
+    p_find.set_defaults(func=cmd_find)
+
+    p_launch = sub.add_parser("launch", help="start a program or URI, optionally waiting for its window")
+    p_launch.add_argument("target", help="executable path or URI")
+    p_launch.add_argument("args", nargs="*", help="arguments")
+    p_launch.add_argument("--window-title", default=None,
+                          help="wait until a visible window whose title contains this appears")
+    p_launch.add_argument("--timeout", type=float, default=30.0,
+                          help="seconds to wait when --window-title is given")
+    p_launch.set_defaults(func=cmd_launch)
 
     p_inspect = sub.add_parser("inspect", help="bounded accessibility inspection")
     p_inspect.add_argument("--max-depth", type=int, default=8)
