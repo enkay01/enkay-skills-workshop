@@ -457,7 +457,8 @@ def _add_act_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--dry-run", action="store_true",
                         help="validate the proposal without dispatching input")
     parser.add_argument("--max-age-ms", type=int, default=None,
-                        help="observation age limit in ms (engine default: 500)")
+                        help="observation age limit in ms "
+                             "(default: 30000 for click/hover/drag/scroll, 500 for keys)")
 
 
 def build_parser() -> argparse.ArgumentParser:

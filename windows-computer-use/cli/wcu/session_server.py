@@ -46,6 +46,22 @@ from wcu.history import History  # noqa: E402
 from wcu.imaging import save_observation_png  # noqa: E402
 
 
+# How stale an observation may be when a pointer action is dispatched
+# against it, in milliseconds.
+#
+# The engine default is 500 ms, which is shorter than one CLI round trip
+# plus an OCR pass over the frame. A click grounded from `wcu ocr` would
+# therefore always be refused as stale, so pointer actions default to 30 s.
+# Keyboard actions bind to window identity and foreground rather than to a
+# point, and keep the engine default.
+POINTER_ACTIONS = frozenset({"click", "hover", "drag", "scroll"})
+POINTER_MAX_AGE_MS = 30000
+
+
+def _default_max_age(action: str) -> int:
+    return POINTER_MAX_AGE_MS if action in POINTER_ACTIONS else 500
+
+
 def _pid_alive(pid: int) -> bool:
     import ctypes
 
@@ -559,7 +575,7 @@ class SessionServer:
         dry_run = bool(args.get("dry_run"))
         obs_id = args.get("observation_id")
         obs_id = int(obs_id) if obs_id is not None else None
-        max_age = int(args.get("max_age_ms", 500))
+        max_age = int(args.get("max_age_ms", _default_max_age(action)))
 
         try:
             dispatch = self._dispatch_action(client, action, args, obs_id, max_age, dry_run)
