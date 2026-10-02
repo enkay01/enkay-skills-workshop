@@ -58,6 +58,7 @@ class WcuClient:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 bufsize=0,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
             self._is_alive = True
             self._stderr_lines = []
@@ -284,7 +285,7 @@ class WcuClient:
         hmonitor: Optional[str] = None,
         device_name: Optional[str] = None,
         after_frame_id: int = 0,
-        timeout_ms: int = 2000,
+        timeout_ms: int = 12000,
     ) -> Tuple[Dict[str, Any], bytes]:
         with self._lock:
             args: Dict[str, Any] = {
@@ -384,7 +385,7 @@ class WcuClient:
     def observe(
         self,
         after_frame_id: int = 0,
-        timeout_ms: int = 2000,
+        timeout_ms: int = 12000,
         monitor_index: Optional[int] = None,
         hmonitor: Optional[Union[str, int]] = None,
         device_name: Optional[str] = None,
@@ -495,7 +496,7 @@ class WcuClient:
         self,
         text: str,
         observation_id: Optional[int] = None,
-        max_age_ms: int = 500,
+        max_age_ms: int = 30000,
         delay_ms: Optional[int] = None,
         dry_run: bool = False,
         timeout_sec: float = 20.0,
@@ -527,7 +528,7 @@ class WcuClient:
         self,
         chord: str,
         observation_id: Optional[int] = None,
-        max_age_ms: int = 500,
+        max_age_ms: int = 30000,
         repeat: Optional[int] = None,
         hold_ms: Optional[int] = None,
         dry_run: bool = False,

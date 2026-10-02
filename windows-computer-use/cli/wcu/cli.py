@@ -247,11 +247,11 @@ def cmd_switch(args: argparse.Namespace) -> int:
 
 
 def cmd_observe(args: argparse.Namespace) -> int:
-    payload: Dict[str, Any] = {"monitor": args.monitor}
+    payload: Dict[str, Any] = {"monitor": args.monitor, "timeout_ms": args.timeout_ms}
     if args.crop:
         payload["crop"] = list(args.crop)
     try:
-        resp = sess.session_call("observe", payload, timeout_sec=15.0)
+        resp = sess.session_call("observe", payload, timeout_sec=(args.timeout_ms / 1000.0) + 3.0)
     except sess.SessionError as e:
         return _handle_session_error(e)
     except PipeError as e:
@@ -267,6 +267,8 @@ def cmd_ocr(args: argparse.Namespace) -> int:
         payload["observation_id"] = args.obs
     if args.region:
         payload["region"] = list(args.region)
+    if getattr(args, "coord_space", None):
+        payload["coord_space"] = args.coord_space
     if args.min_confidence:
         payload["min_confidence"] = args.min_confidence
     try:
@@ -290,6 +292,8 @@ def cmd_find(args: argparse.Namespace) -> int:
         payload["observation_id"] = args.obs
     if args.region:
         payload["region"] = list(args.region)
+    if getattr(args, "coord_space", None):
+        payload["coord_space"] = args.coord_space
     if args.threshold is not None:
         payload["threshold"] = args.threshold
     if args.tolerance is not None:
@@ -424,6 +428,10 @@ def cmd_act(args: argparse.Namespace) -> int:
         action_args["token"] = args.token
     if getattr(args, "value", None) is not None:
         action_args["value"] = args.value
+    if getattr(args, "coord_space", None):
+        action_args["coord_space"] = args.coord_space
+    if getattr(args, "auto_refresh", False):
+        action_args["auto_refresh"] = True
 
     try:
         resp = sess.session_call("act", action_args, timeout_sec=30.0)
@@ -448,6 +456,69 @@ def _session_id() -> Optional[str]:
         return None
 
 
+def cmd_install_skill(args: argparse.Namespace) -> int:
+    from wcu import installer
+
+    if getattr(args, "check", False):
+        info = installer.inspect_skills()
+        return _emit(_envelope(None, True, "ok", result=info))
+
+    mode = getattr(args, "mode", "link")
+    targets = getattr(args, "targets", None)
+    res = installer.install_skills(mode=mode, targets=targets)
+    all_ok = all(
+        isinstance(a, dict) and a.get("status") != "error"
+        for a in res.get("actions", {}).values()
+    )
+    status = "ok" if all_ok else "error"
+    return _emit(_envelope(None, all_ok, status, result=res))
+
+
+def cmd_release(args: argparse.Namespace) -> int:
+    from wcu import paths
+
+    script = paths.repo_root() / "scripts" / "release.py"
+    if not script.is_file():
+        from wcu import installer
+
+        if getattr(args, "check", False):
+            info = installer.inspect_skills()
+            return _emit(_envelope(None, True, "ok", result=info))
+        return _emit(
+            _error_env(
+                None, "repo_not_found", "wcu release requires a repository checkout"
+            )
+        )
+
+    cmd = [sys.executable, str(script)]
+    if getattr(args, "skip_tests", False):
+        cmd.append("--skip-tests")
+    if getattr(args, "copy", False):
+        cmd.append("--copy")
+    if getattr(args, "check", False):
+        cmd.append("--check")
+    if getattr(args, "clean", False):
+        cmd.append("--clean")
+
+    res = subprocess.run(cmd, stdout=sys.stderr, stderr=sys.stderr)
+    ok = res.returncode == 0
+    status = "ok" if ok else "error"
+    return _emit(
+        _envelope(
+            None,
+            ok,
+            status,
+            result={"exit_code": res.returncode},
+            error=None
+            if ok
+            else {
+                "code": "release_failed",
+                "message": f"release script exited with code {res.returncode}",
+            },
+        )
+    )
+
+
 # ----------------------------------------------------------------------
 # Argument parsing
 # ----------------------------------------------------------------------
@@ -458,7 +529,10 @@ def _add_act_common(parser: argparse.ArgumentParser) -> None:
                         help="validate the proposal without dispatching input")
     parser.add_argument("--max-age-ms", type=int, default=None,
                         help="observation age limit in ms "
-                             "(default: 30000 for click/hover/drag/scroll, 500 for keys)")
+                             "(default: 30000 for pointer and keyboard actions)")
+    parser.add_argument("--auto-refresh", "--retry-if-stale", action="store_true",
+                        dest="auto_refresh", default=False,
+                        help="auto-refresh and revalidate against a fresh observation if refused for staleness")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -505,12 +579,16 @@ def build_parser() -> argparse.ArgumentParser:
                            help="capture the primary monitor instead of the attached window")
     p_observe.add_argument("--crop", nargs=4, type=int, metavar=("X", "Y", "W", "H"),
                            help="write only this region at native resolution; the observation carries crop_offset")
+    p_observe.add_argument("--timeout-ms", type=int, default=12000,
+                           help="frame wait in ms (default 12000; total deadline is this + 3s)")
     p_observe.set_defaults(func=cmd_observe)
 
     p_ocr = sub.add_parser("ocr", help="text-target grounding over the last observation")
     p_ocr.add_argument("--obs", type=int, default=None,
                        help="observation id (default: the most recent)")
-    p_ocr.add_argument("--region", nargs=4, type=int, metavar=("X", "Y", "W", "H"),
+    p_ocr.add_argument("--coord-space", choices=["physical", "logical", "normalized"], default="physical",
+                       help="coordinate space for --region (default: physical)")
+    p_ocr.add_argument("--region", nargs=4, type=float, metavar=("X", "Y", "W", "H"),
                        help="OCR only inside this region, in observation pixels")
     p_ocr.add_argument("--match", default=None,
                        help="substring to look for; the best hit is returned as 'matched'")
@@ -523,7 +601,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_find.add_argument("--color", default=None,
                         help="target colour as #RRGGBB")
     p_find.add_argument("--obs", type=int, default=None)
-    p_find.add_argument("--region", nargs=4, type=int, metavar=("X", "Y", "W", "H"))
+    p_find.add_argument("--coord-space", choices=["physical", "logical", "normalized"], default="physical",
+                        help="coordinate space for --region (default: physical)")
+    p_find.add_argument("--region", nargs=4, type=float, metavar=("X", "Y", "W", "H"))
     p_find.add_argument("--threshold", type=float, default=None,
                         help="template match confidence floor (default 0.8)")
     p_find.add_argument("--tolerance", type=int, default=None,
@@ -560,8 +640,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_click = act_sub.add_parser("click", help="click a target")
     _add_act_common(p_click)
     p_click.add_argument("--observation-id", type=int, required=True)
-    p_click.add_argument("--bbox", nargs=4, type=int, metavar=("X", "Y", "W", "H"))
-    p_click.add_argument("--point", nargs=2, type=int, metavar=("X", "Y"))
+    p_click.add_argument("--coord-space", choices=["physical", "logical", "normalized"], default="physical",
+                         help="coordinate space (default: physical)")
+    p_click.add_argument("--bbox", nargs=4, type=float, metavar=("X", "Y", "W", "H"))
+    p_click.add_argument("--point", nargs=2, type=float, metavar=("X", "Y"))
     p_click.add_argument("--button", default="left", choices=["left", "right", "middle"])
     p_click.add_argument("--click-count", type=int, default=1, choices=[1, 2])
     p_click.set_defaults(func=cmd_act)
@@ -586,22 +668,28 @@ def build_parser() -> argparse.ArgumentParser:
     p_scroll.add_argument("--notches-x", type=int, default=None)
     p_scroll.add_argument("--notches-y", type=int, default=None)
     p_scroll.add_argument("--observation-id", type=int, default=None)
-    p_scroll.add_argument("--point", nargs=2, type=int, metavar=("X", "Y"))
+    p_scroll.add_argument("--coord-space", choices=["physical", "logical", "normalized"], default="physical",
+                          help="coordinate space (default: physical)")
+    p_scroll.add_argument("--point", nargs=2, type=float, metavar=("X", "Y"))
     p_scroll.set_defaults(func=cmd_act)
 
     p_hover = act_sub.add_parser("hover", help="move the pointer without clicking")
     _add_act_common(p_hover)
     p_hover.add_argument("--observation-id", type=int, required=True)
-    p_hover.add_argument("--point", nargs=2, type=int, metavar=("X", "Y"))
-    p_hover.add_argument("--bbox", nargs=4, type=int, metavar=("X", "Y", "W", "H"))
+    p_hover.add_argument("--coord-space", choices=["physical", "logical", "normalized"], default="physical",
+                         help="coordinate space (default: physical)")
+    p_hover.add_argument("--point", nargs=2, type=float, metavar=("X", "Y"))
+    p_hover.add_argument("--bbox", nargs=4, type=float, metavar=("X", "Y", "W", "H"))
     p_hover.add_argument("--duration-ms", type=int, default=None)
     p_hover.set_defaults(func=cmd_act)
 
     p_drag = act_sub.add_parser("drag", help="drag between two points")
     _add_act_common(p_drag)
     p_drag.add_argument("--observation-id", type=int, required=True)
-    p_drag.add_argument("--from", dest="from_", nargs=2, type=int, metavar=("X", "Y"), required=True)
-    p_drag.add_argument("--to", nargs=2, type=int, metavar=("X", "Y"), required=True)
+    p_drag.add_argument("--coord-space", choices=["physical", "logical", "normalized"], default="physical",
+                        help="coordinate space (default: physical)")
+    p_drag.add_argument("--from", dest="from_", nargs=2, type=float, metavar=("X", "Y"), required=True)
+    p_drag.add_argument("--to", nargs=2, type=float, metavar=("X", "Y"), required=True)
     p_drag.add_argument("--steps", type=int, default=None)
     p_drag.add_argument("--duration-ms", type=int, default=None)
     p_drag.set_defaults(func=cmd_act)
@@ -621,6 +709,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_setval.add_argument("--token", required=True)
     p_setval.add_argument("--value", default=None)
     p_setval.set_defaults(func=cmd_act)
+
+    p_release = sub.add_parser("release", help="build engine, update cli, sync skills, and verify release")
+    p_release.add_argument("--skip-tests", action="store_true", help="skip regression tests")
+    p_release.add_argument("--copy", action="store_true", help="use file copy instead of directory junctions")
+    p_release.add_argument("--check", action="store_true", help="check status across engine, session, and skills")
+    p_release.add_argument("--clean", action="store_true", help="clean cargo build target before building")
+    p_release.set_defaults(func=cmd_release)
+
+    p_install_skill = sub.add_parser("install-skill", help="mount/sync WCU skill into agent environments (.gemini, .agents, .claude)")
+    p_install_skill.add_argument("--mode", choices=["link", "copy"], default="link", help="link (junction) or copy (default: link)")
+    p_install_skill.add_argument("--targets", nargs="*", choices=["gemini", "agents", "claude"], help="target hosts (default: all)")
+    p_install_skill.add_argument("--check", action="store_true", help="inspect existing skill installations without modifying")
+    p_install_skill.set_defaults(func=cmd_install_skill)
 
     return parser
 

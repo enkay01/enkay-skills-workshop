@@ -42,24 +42,31 @@ from wcu_client import WcuClient, WcuError  # noqa: E402
 from wcu import ipc  # noqa: E402
 from wcu.constants import REFUSAL_CODES  # noqa: E402
 from wcu.grounding import clamp_region, find_color, match_template  # noqa: E402
+from wcu.coordinates import (
+    build_geometry_metadata,
+    resolve_bbox,
+    resolve_point,
+)
 from wcu.history import History  # noqa: E402
 from wcu.imaging import save_observation_png  # noqa: E402
 
 
-# How stale an observation may be when a pointer action is dispatched
+# How stale an observation may be when a pointer or keyboard action is dispatched
 # against it, in milliseconds.
 #
 # The engine default is 500 ms, which is shorter than one CLI round trip
 # plus an OCR pass over the frame. A click grounded from `wcu ocr` would
-# therefore always be refused as stale, so pointer actions default to 30 s.
-# Keyboard actions bind to window identity and foreground rather than to a
-# point, and keep the engine default.
+# therefore always be refused as stale, so pointer and keyboard actions default to 30 s.
+# Window identity and foreground guards protect keyboard actions.
 POINTER_ACTIONS = frozenset({"click", "hover", "drag", "scroll"})
+KEYBOARD_ACTIONS = frozenset({"press", "type", "type_text", "press_key"})
+ALL_DEFAULT_30S_ACTIONS = POINTER_ACTIONS | KEYBOARD_ACTIONS
 POINTER_MAX_AGE_MS = 30000
+KEYBOARD_MAX_AGE_MS = 30000
 
 
 def _default_max_age(action: str) -> int:
-    return POINTER_MAX_AGE_MS if action in POINTER_ACTIONS else 500
+    return 30000 if action in ALL_DEFAULT_30S_ACTIONS else 500
 
 
 def _pid_alive(pid: int) -> bool:
@@ -121,6 +128,8 @@ class SessionServer:
         # be pointed at an explicit id or at simply "the latest".
         self._observation_paths: Dict[int, Path] = {}
         self._last_observation_path: Optional[Path] = None
+        self._observation_meta: Dict[int, Dict[str, Any]] = {}
+        self._last_observation_meta: Optional[Dict[str, Any]] = None
 
     # ------------------------------------------------------------------
     # Engine lifecycle
@@ -152,12 +161,13 @@ class SessionServer:
         self,
         monitor: bool = False,
         crop: Optional[Sequence[int]] = None,
+        timeout_ms: int = 12000,
     ) -> Dict[str, Any]:
         client = self.ensure_engine()
         if monitor:
-            meta, payload = client.observe_monitor()
+            meta, payload = client.observe_monitor(timeout_ms=timeout_ms)
         else:
-            meta, payload = client.observe()
+            meta, payload = client.observe(timeout_ms=timeout_ms)
         width = int(meta["width"])
         height = int(meta["height"])
         crop_offset = [0, 0]
@@ -178,9 +188,26 @@ class SessionServer:
             meta["full_height"] = height
             meta["width"] = crop_size[0]
             meta["height"] = crop_size[1]
-        self._observation_paths[int(meta.get("observation_id", 0))] = path
+        meta["geometry"] = build_geometry_metadata(meta, crop_size=crop_size)
+        obs_id = int(meta.get("observation_id", 0))
+        self._observation_paths[obs_id] = path
         self._last_observation_path = path
+        self._observation_meta[obs_id] = meta
+        self._last_observation_meta = meta
         return meta
+
+    def _get_observation_meta(
+        self, obs_id: Optional[int]
+    ) -> Tuple[Dict[str, Any], Optional[int]]:
+        """Retrieve observation metadata for an explicit id or the most recent."""
+        if obs_id is not None:
+            meta = self._observation_meta.get(obs_id)
+            if meta is not None:
+                return meta, obs_id
+        if self._last_observation_meta is not None:
+            last_id = self._last_observation_meta.get("observation_id")
+            return self._last_observation_meta, int(last_id) if last_id is not None else None
+        return {}, obs_id
 
     def _read_observation(
         self, args: Dict[str, Any]
@@ -297,7 +324,9 @@ class SessionServer:
 
     def op_observe(self, args: Dict[str, Any]) -> Dict[str, Any]:
         return self._observe_and_save(
-            monitor=bool(args.get("monitor")), crop=args.get("crop")
+            monitor=bool(args.get("monitor")),
+            crop=args.get("crop"),
+            timeout_ms=int(args.get("timeout_ms", 12000)),
         )
 
     def op_ocr(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -314,6 +343,21 @@ class SessionServer:
         region = args.get("region")
         clamped: Optional[Tuple[int, int, int, int]] = None
         if region is not None:
+            coord_space = str(args.get("coord_space", "physical"))
+            if coord_space != "physical":
+                obs_meta, _ = self._get_observation_meta(_obs_id)
+                geometry = obs_meta.get("geometry") or build_geometry_metadata(
+                    {"width": img_w, "height": img_h}
+                )
+                crop_offset = obs_meta.get("crop_offset", [0, 0])
+                region = list(
+                    resolve_bbox(
+                        region,
+                        geometry,
+                        coord_space=coord_space,
+                        crop_offset=crop_offset,
+                    )
+                )
             try:
                 clamped = clamp_region(img_w, img_h, region)
             except ValueError as e:
@@ -385,6 +429,21 @@ class SessionServer:
         region = args.get("region")
         clamped: Optional[Tuple[int, int, int, int]] = None
         if region is not None:
+            coord_space = str(args.get("coord_space", "physical"))
+            if coord_space != "physical":
+                obs_meta, _ = self._get_observation_meta(_obs_id)
+                geometry = obs_meta.get("geometry") or build_geometry_metadata(
+                    {"width": img_w, "height": img_h}
+                )
+                crop_offset = obs_meta.get("crop_offset", [0, 0])
+                region = list(
+                    resolve_bbox(
+                        region,
+                        geometry,
+                        coord_space=coord_space,
+                        crop_offset=crop_offset,
+                    )
+                )
             try:
                 clamped = clamp_region(img_w, img_h, region)
             except ValueError as e:
@@ -573,16 +632,96 @@ class SessionServer:
         client = self.ensure_engine()
         action = str(args.get("action", ""))
         dry_run = bool(args.get("dry_run"))
+        auto_refresh = bool(args.get("auto_refresh"))
         obs_id = args.get("observation_id")
         obs_id = int(obs_id) if obs_id is not None else None
         max_age = int(args.get("max_age_ms", _default_max_age(action)))
 
         try:
-            dispatch = self._dispatch_action(client, action, args, obs_id, max_age, dry_run)
+            dispatch, res_pt, res_box = self._dispatch_action(
+                client, action, args, obs_id, max_age, dry_run
+            )
         except WcuError as e:
             if self.cancel_event.is_set():
                 self.cancel_event.clear()
                 raise WcuError("cancelled", "Operation cancelled") from e
+
+            # Stale-observation fast-path and auto-refresh
+            if auto_refresh and e.code == "stale_observation" and not dry_run:
+                current_obs_id = obs_id
+                for attempt in range(3):
+                    fresh_meta = self._observe_and_save()
+                    new_obs_id = int(fresh_meta.get("observation_id", 0))
+
+                    # Safety boundary validation against the previous observation
+                    prev_meta = (
+                        self._observation_meta.get(current_obs_id)
+                        if current_obs_id is not None
+                        else self._last_observation_meta
+                    )
+                    if prev_meta:
+                        orig_ident = prev_meta.get("window_identity") or {}
+                        fresh_ident = fresh_meta.get("window_identity") or {}
+                        if (
+                            str(orig_ident.get("hwnd")) != str(fresh_ident.get("hwnd"))
+                            or orig_ident.get("pid") != fresh_ident.get("pid")
+                        ):
+                            raise WcuError(
+                                "window_moved",
+                                "Auto-refresh aborted: window identity changed",
+                                {"evidence": fresh_meta, "action": action},
+                            ) from e
+                        if (
+                            fresh_meta.get("geometry_epoch")
+                            != prev_meta.get("geometry_epoch")
+                        ):
+                            raise WcuError(
+                                "window_moved",
+                                "Auto-refresh aborted: window geometry changed",
+                                {"evidence": fresh_meta, "action": action},
+                            ) from e
+                        if (
+                            fresh_meta.get("foreground_epoch")
+                            != prev_meta.get("foreground_epoch")
+                        ):
+                            raise WcuError(
+                                "foreground_lost",
+                                "Auto-refresh aborted: window lost foreground",
+                                {"evidence": fresh_meta, "action": action},
+                            ) from e
+
+                    try:
+                        dispatch, res_pt, res_box = self._dispatch_action(
+                            client, action, args, new_obs_id, max_age, dry_run
+                        )
+                        self.history.record(
+                            f"act:{action}", "ok", observation_id=new_obs_id
+                        )
+                        result: Dict[str, Any] = {
+                            "status": "ok",
+                            "action": action,
+                            "auto_refreshed": True,
+                            "observation_id": new_obs_id,
+                            "stale_observation_id": obs_id,
+                            "dispatch": dispatch,
+                            "evidence": fresh_meta,
+                        }
+                        if res_pt is not None:
+                            result["resolved_physical_point"] = res_pt
+                        if res_box is not None:
+                            result["resolved_physical_bbox"] = res_box
+                        return result
+                    except WcuError as retry_err:
+                        if retry_err.code == "stale_observation" and attempt < 2:
+                            current_obs_id = new_obs_id
+                            time.sleep(0.05)
+                            continue
+                        raise WcuError(
+                            retry_err.code,
+                            retry_err.message,
+                            {"evidence": fresh_meta, "action": action},
+                        ) from retry_err
+
             if e.code in REFUSAL_CODES and not dry_run:
                 # The proposal no longer applies. Return updated evidence so
                 # the caller can reconsider without redundant setup. The
@@ -610,6 +749,10 @@ class SessionServer:
             "action": action,
             "dispatch": dispatch,
         }
+        if res_pt is not None:
+            result["resolved_physical_point"] = res_pt
+        if res_box is not None:
+            result["resolved_physical_bbox"] = res_box
         if not dry_run:
             # Post-action evidence so the caller can choose the next step.
             result["evidence"] = self._observe_and_save()
@@ -623,15 +766,30 @@ class SessionServer:
         obs_id: Optional[int],
         max_age: int,
         dry_run: bool,
-    ) -> Dict[str, Any]:
+    ) -> Tuple[Dict[str, Any], Optional[List[int]], Optional[List[int]]]:
+        coord_space = str(args.get("coord_space", "physical"))
+        obs_meta, _ = self._get_observation_meta(obs_id)
+        geometry = obs_meta.get("geometry") or build_geometry_metadata(obs_meta)
+        crop_offset = obs_meta.get("crop_offset", [0, 0])
+        resolved_point: Optional[List[int]] = None
+        resolved_bbox: Optional[List[int]] = None
+
         if action == "click":
             if args.get("bbox"):
-                target = {"bbox_frame_px": [int(v) for v in args["bbox"]]}
+                px_bbox = resolve_bbox(
+                    args["bbox"], geometry, coord_space=coord_space, crop_offset=crop_offset
+                )
+                target = {"bbox_frame_px": list(px_bbox)}
+                resolved_bbox = list(px_bbox)
             elif args.get("point"):
-                target = {"point_frame_px": [int(v) for v in args["point"]]}
+                px_point = resolve_point(
+                    args["point"], geometry, coord_space=coord_space, crop_offset=crop_offset
+                )
+                target = {"point_frame_px": list(px_point)}
+                resolved_point = list(px_point)
             else:
                 raise WcuError("invalid_request", "click needs bbox or point")
-            return client.click(
+            dispatch = client.click(
                 observation_id=obs_id,
                 target=target,
                 max_age_ms=max_age,
@@ -639,8 +797,9 @@ class SessionServer:
                 button=str(args.get("button", "left")),
                 click_count=int(args.get("click_count", 1)),
             )
+            return dispatch, resolved_point, resolved_bbox
         if action == "type":
-            return client.type_text(
+            dispatch = client.type_text(
                 text=str(args.get("text", "")),
                 observation_id=obs_id,
                 max_age_ms=max_age,
@@ -648,18 +807,24 @@ class SessionServer:
                 method=str(args.get("method", "unicode")),
                 dry_run=dry_run,
             )
+            return dispatch, None, None
         if action == "press":
-            return client.press_key(
+            dispatch = client.press_key(
                 chord=str(args.get("chord", "")),
                 observation_id=obs_id,
                 max_age_ms=max_age,
                 dry_run=dry_run,
             )
+            return dispatch, None, None
         if action == "scroll":
             target = None
             if args.get("point"):
-                target = {"point_frame_px": [int(v) for v in args["point"]]}
-            return client.scroll(
+                px_point = resolve_point(
+                    args["point"], geometry, coord_space=coord_space, crop_offset=crop_offset
+                )
+                target = {"point_frame_px": list(px_point)}
+                resolved_point = list(px_point)
+            dispatch = client.scroll(
                 notches_x=int(args.get("notches_x", 0)),
                 notches_y=int(args.get("notches_y", 0)),
                 observation_id=obs_id,
@@ -667,49 +832,69 @@ class SessionServer:
                 dry_run=dry_run,
                 target=target,
             )
+            return dispatch, resolved_point, None
         if action == "hover":
             if args.get("point"):
-                target = {"point_frame_px": [int(v) for v in args["point"]]}
+                px_point = resolve_point(
+                    args["point"], geometry, coord_space=coord_space, crop_offset=crop_offset
+                )
+                target = {"point_frame_px": list(px_point)}
+                resolved_point = list(px_point)
             elif args.get("bbox"):
-                target = {"bbox_frame_px": [int(v) for v in args["bbox"]]}
+                px_bbox = resolve_bbox(
+                    args["bbox"], geometry, coord_space=coord_space, crop_offset=crop_offset
+                )
+                target = {"bbox_frame_px": list(px_bbox)}
+                resolved_bbox = list(px_bbox)
             else:
                 raise WcuError("invalid_request", "hover needs point or bbox")
-            return client.hover(
+            dispatch = client.hover(
                 observation_id=obs_id,
                 target=target,
                 max_age_ms=max_age,
                 dry_run=dry_run,
                 duration_ms=args.get("duration_ms"),
             )
+            return dispatch, resolved_point, resolved_bbox
         if action == "drag":
             if not args.get("from") or not args.get("to"):
                 raise WcuError("invalid_request", "drag needs from and to points")
-            return client.drag(
-                from_target={"point_frame_px": [int(v) for v in args["from"]]},
-                to_target={"point_frame_px": [int(v) for v in args["to"]]},
+            from_pt = resolve_point(
+                args["from"], geometry, coord_space=coord_space, crop_offset=crop_offset
+            )
+            to_pt = resolve_point(
+                args["to"], geometry, coord_space=coord_space, crop_offset=crop_offset
+            )
+            dispatch = client.drag(
+                from_target={"point_frame_px": list(from_pt)},
+                to_target={"point_frame_px": list(to_pt)},
                 observation_id=obs_id,
                 max_age_ms=max_age,
                 dry_run=dry_run,
                 steps=args.get("steps"),
                 duration_ms=args.get("duration_ms"),
             )
+            return dispatch, list(from_pt), None
         if action == "focus":
             window = self._find_window(args.get("hwnd", ""))
-            return client.focus_window(
+            dispatch = client.focus_window(
                 window["hwnd"],
                 pid=window["pid"],
                 process_create_time_utc=window.get("process_create_time_utc"),
             )
+            return dispatch, None, None
         if action == "invoke":
-            return client.uia_action(
+            dispatch = client.uia_action(
                 token=str(args.get("token", "")), action="invoke"
             )
+            return dispatch, None, None
         if action == "set-value":
-            return client.uia_action(
+            dispatch = client.uia_action(
                 token=str(args.get("token", "")),
                 action="set_value",
                 value=args.get("value"),
             )
+            return dispatch, None, None
         raise WcuError("invalid_request", f"Unknown action '{action}'")
 
     def op_stop(self, args: Dict[str, Any]) -> Dict[str, Any]:

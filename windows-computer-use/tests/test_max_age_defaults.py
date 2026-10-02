@@ -41,10 +41,10 @@ def test_pointer_client_default_is_30s(action):
 
 
 @pytest.mark.parametrize("action", KEY_ACTIONS)
-def test_key_client_default_unchanged(action):
-    """Keyboard actions bind to window identity, not a point, and stay at 500."""
+def test_key_client_default_is_30s(action):
+    """Keyboard actions also default to 30 s to avoid startup latency failures."""
     param = inspect.signature(getattr(WcuClient, action)).parameters["max_age_ms"]
-    assert param.default == 500
+    assert param.default == 30000
 
 
 @pytest.mark.parametrize("action", POINTER_ACTIONS)
@@ -56,10 +56,10 @@ def test_pointer_server_default_is_30s(action):
 
 
 @pytest.mark.parametrize("action", KEY_ACTIONS)
-def test_key_server_default_unchanged(action):
+def test_key_server_default_is_30s(action):
     from wcu.session_server import _default_max_age
 
-    assert _default_max_age(action) == 500
+    assert _default_max_age(action) == 30000
 
 
 def test_unknown_action_falls_back_to_engine_default():

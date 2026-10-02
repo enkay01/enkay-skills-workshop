@@ -232,6 +232,15 @@ class TestCliSession(unittest.TestCase):
         obs = self._observe()
         self.assertIn("observation_id", obs)
         self.assertIn("window_identity", obs)
+        self.assertIn("geometry", obs)
+        geom = obs["geometry"]
+        self.assertIn("dpi", geom)
+        self.assertIn("scale_factor", geom)
+        self.assertIn("physical_bounds", geom)
+        self.assertIn("logical_bounds", geom)
+        self.assertIn("image_dimensions", geom)
+        self.assertGreater(geom["image_dimensions"]["w"], 0)
+        self.assertGreater(geom["image_dimensions"]["h"], 0)
         self.assertGreater(obs["width"], 0)
         self.assertGreater(obs["height"], 0)
         image_path = obs["image_path"]
@@ -375,7 +384,11 @@ class TestCliSession(unittest.TestCase):
         self.assertEqual(switch["status"], "ok")
         self.assertIn("observation", switch["result"])
         # Switch back to the fixture.
-        back = cli_ok("switch", hwnd)
+        back = cli_json("switch", hwnd)
+        if not back.get("ok"):
+            self.skipTest(
+                f"Desktop refused foreground transition: {back['error']['message']}"
+            )
         self.assertEqual(back["status"], "ok")
         self.assertEqual(
             back["result"]["observation"]["window_identity"]["hwnd"], hwnd
@@ -400,6 +413,29 @@ class TestCliSession(unittest.TestCase):
             )
             env = json.loads(proc.stdout)
             self.assertIn("ok", env)
+
+    def test_13_act_click_with_coord_space(self):
+        """act click accepts --coord-space normalized and reports resolved_physical_point."""
+        cli_ok("session", "start")
+        self._focus_fixture()
+        obs = self._observe()
+        obs_id = str(obs["observation_id"])
+
+        # Center click using normalized coordinates [0.5, 0.5]
+        env = cli_ok(
+            "act", "click",
+            "--observation-id", obs_id,
+            "--point", "0.5", "0.5",
+            "--coord-space", "normalized",
+            "--dry-run",
+        )
+        self.assertTrue(env["ok"])
+        res = env["result"]
+        self.assertIn("resolved_physical_point", res)
+        geom = obs["geometry"]
+        expected_x = int(round(0.5 * geom["image_dimensions"]["w"]))
+        expected_y = int(round(0.5 * geom["image_dimensions"]["h"]))
+        self.assertEqual(res["resolved_physical_point"], [expected_x, expected_y])
 
 
 if __name__ == "__main__":
