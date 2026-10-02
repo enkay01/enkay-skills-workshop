@@ -90,11 +90,11 @@ def test_install_skills_mocked(tmp_path, monkeypatch):
     }
     monkeypatch.setattr(installer, "get_target_dirs", lambda: mock_targets)
 
-    # Link mode
+    # Default sync mode: gemini and agents get real directories, claude gets junction
     res = installer.install_skills(mode="link")
     assert res["requested_mode"] == "link"
-    assert res["actions"]["gemini"]["status"] == "linked"
-    assert res["actions"]["agents"]["status"] == "linked"
+    assert res["actions"]["gemini"]["status"] == "copied"
+    assert res["actions"]["agents"]["status"] == "copied"
     assert res["actions"]["claude"]["status"] == "linked"
 
     assert gemini_dir.exists()

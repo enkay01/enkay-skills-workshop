@@ -148,6 +148,12 @@ def inspect_skills() -> Dict[str, Any]:
             except Exception:
                 pass
 
+        compatible = True
+        warning = None
+        if name == "gemini" and reparse:
+            compatible = False
+            warning = "Gemini UI scanner ignores NTFS junctions and symlinks; requires a real directory."
+
         kind = "junction" if reparse else ("directory" if exists else "missing")
         report["targets"][name] = {
             "path": str(path),
@@ -156,6 +162,8 @@ def inspect_skills() -> Dict[str, Any]:
             "link_target": str(link_target) if link_target else None,
             "points_to_canonical": points_to_canonical,
             "has_skill_md": has_skill_md,
+            "compatible": compatible,
+            "warning": warning,
         }
 
     return report
@@ -203,8 +211,20 @@ def install_skills(
 
         target_path = all_targets[name]
         try:
-            if actual_mode == "link":
-                # For claude, point to agents junction if claude is configured to link to agents
+            # Gemini / Antigravity UI scanner does not traverse NTFS junctions or symlinks;
+            # it strictly requires a real directory on disk.
+            # Similarly, ~/.agents/skills on this system uses real directories, while
+            # ~/.claude/skills uses junctions pointing to ~/.agents/skills/<name>.
+            if actual_mode == "copy" or name == "gemini" or (name == "agents" and actual_mode != "all-links"):
+                copy_skill_dir(source, target_path)
+                results["actions"][name] = {
+                    "status": "copied",
+                    "target": str(target_path),
+                    "source": str(source),
+                    "note": "real directory required by host scanner" if name == "gemini" else None,
+                }
+            elif actual_mode in ("link", "all-links"):
+                # For claude, point to agents directory if available
                 if name == "claude" and "agents" in active_targets:
                     create_directory_junction(agents_path, target_path)
                     results["actions"][name] = {
