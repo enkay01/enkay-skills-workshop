@@ -7,6 +7,7 @@ A repository of developer skills, deterministic CLI utilities, and Antigravity l
 - `skills/`: Markdown skill definitions for Antigravity, Claude, and agent runtimes.
   - `agent-hooks/`: Configuration guide for Antigravity lifecycle hooks.
   - `google-developer-docs-style/`: Google technical documentation guidelines.
+  - `pdf-renderer/`: Renders PDF files as viewable HTML artifacts with base64-encoded page images.
 - `tools/fast-tools/`: Native Rust crate compiling to `fast-tools`, providing Git snapshots, style enforcement, and lifecycle hook handlers.
 - `config/hooks.json`: Lifecycle hook configurations for runtime tool rewriting, auto-fixing, and style guards.
 - `install.sh`: Installation script to build the release binary, install it to `~/.local/bin/`, and configure global lifecycle hooks.
