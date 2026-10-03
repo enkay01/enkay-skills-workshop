@@ -31,6 +31,7 @@ If it is missing, tell the user and offer to install it.
 2. **Convert pages to PNG** at 200 DPI into a scratch directory:
 
    ```bash
+   rm -rf "<artifact_dir>/scratch/pdf_pages"
    mkdir -p "<artifact_dir>/scratch/pdf_pages"
    pdftoppm -png -r 200 "<path-to-pdf>" "<artifact_dir>/scratch/pdf_pages/page"
    ```
@@ -45,11 +46,16 @@ If it is missing, tell the user and offer to install it.
 
    ```python
    import base64, pathlib
+   from html import escape as html_escape
+   from urllib.parse import quote as url_quote
 
    artifact_dir = "<artifact_dir>"
    pages_dir = pathlib.Path(artifact_dir) / "scratch" / "pdf_pages"
    original_path = "<absolute-path-to-original-pdf>"
    filename = pathlib.Path(original_path).name
+
+   safe_filename = html_escape(filename)
+   safe_href = "file://" + url_quote(original_path, safe="/")
 
    page_files = sorted(pages_dir.glob("page-*.png"))
    total = len(page_files)
@@ -66,7 +72,7 @@ If it is missing, tell the user and offer to install it.
            'class="w-full rounded" /></div>'
        )
 
-   html = f"""<!DOCTYPE html>
+   html_content = f"""<!DOCTYPE html>
    <html>
    <head>
      <script src="https://www.gstatic.com/antigravity/web/dev/tailwindcss.min.js"></script>
@@ -74,12 +80,12 @@ If it is missing, tell the user and offer to install it.
    <body class="bg-[var(--background)] text-[var(--foreground)] antialiased p-6">
      <div class="max-w-4xl mx-auto space-y-6">
        <div class="bg-[var(--card)] border border-[var(--border)] rounded-xl p-5 shadow-sm">
-         <h1 class="text-xl font-semibold">{filename}</h1>
+         <h1 class="text-xl font-semibold">{safe_filename}</h1>
          <p class="text-[var(--muted-foreground)] text-sm mt-1">{total} pages</p>
          <p class="text-[var(--muted-foreground)] text-sm mt-1">
            Original file:
-           <a href="file://{original_path}"
-              class="text-[var(--primary)] underline">{filename}</a>
+           <a href="{safe_href}"
+              class="text-[var(--primary)] underline">{safe_filename}</a>
          </p>
        </div>
        {"".join(page_blocks)}
@@ -88,7 +94,7 @@ If it is missing, tell the user and offer to install it.
    </html>"""
 
    out = pathlib.Path(artifact_dir) / "pdf_viewer.html"
-   out.write_text(html)
+   out.write_text(html_content)
    ```
 
 4. **Write the artifact** using `write_to_file` with `Overwrite: true` and
