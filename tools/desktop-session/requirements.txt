@@ -1,6 +1,0 @@
-Pillow>=10,<13
-PyAutoGUI>=0.9.54,<1
-pyobjc-core>=10,<13
-pyobjc-framework-Cocoa>=10,<13
-pyobjc-framework-Quartz>=10,<13
-pyobjc-framework-Vision>=10,<13
