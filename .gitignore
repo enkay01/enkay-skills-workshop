@@ -6,4 +6,7 @@ target/
 .env.local
 __pycache__/
 *.py[cod]
+.pytest_cache/
+artifacts/
+scratch/
 fixture_log.txt
