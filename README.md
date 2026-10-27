@@ -5,6 +5,7 @@ A repository of developer skills designed for low-latency agent workflows.
 ## Contents
 
 - `skills/`: Markdown skill definitions for Antigravity, Claude, and agent runtimes.
+  - `come-again/`: Rephrases the previous response for human comprehension and enforces plain-language communication constraints for the session.
   - `google-developer-docs-style/`: Google technical documentation guidelines.
   - `mac-computer-use/`: Desktop automation on macOS via PyAutoGUI and Quartz event taps.
   - `pdf-renderer/`: Renders PDF files as viewable HTML artifacts with base64-encoded page images.
