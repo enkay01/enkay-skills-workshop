@@ -1,6 +1,6 @@
 ---
 name: be-bold
-description: "Analyse thoroughly and recommend bold courses of action: work that reaches a large part of the goal, needs a genuinely novel approach, or needs several iterations or a hill-climb carried out in one pass. Use only when the user explicitly invokes /be-bold or asks to be bold, for planning, design, diagnosis, review, or any request where the agent proposes what to do next."
+description: "Analyse thoroughly and recommend bold courses of action: work that reaches a large part of the goal, needs a genuinely novel approach, or proposes an iteration loop or hill-climb that delivers a substantial result. Use only when the user explicitly invokes /be-bold or asks to be bold, for planning, design, diagnosis, review, or any request where the agent proposes what to do next."
 ---
 
 # Be Bold
@@ -15,9 +15,9 @@ A recommendation is bold when it meets at least one of these conditions:
 
 - It reaches a large share of the goal in one move instead of a small increment.
 - It needs an approach that is genuinely novel for this problem, where the obvious option is known and falls short.
-- It needs several iterations or a hill-climb to land, and you carry those iterations out now rather than proposing them as future work.
+- It is an iteration loop or hill-climb whose accumulated iterations deliver the substantial result, where no single step would. The recommendation states the whole loop, not one round of it.
 
-Boldness is a property of the action, measured against the goal. State the size of the effect with concrete evidence: what part of the goal it reaches, which measurements move and by how much, which failure modes it closes. Do not label the recommendation bold. A recommendation described as bold, ambitious, or visionary, with nothing behind the words, is a small recommendation in disguise.
+Boldness is a property of the proposed action, measured against the goal. State the size of the effect with concrete evidence: what part of the goal it reaches, which measurements move and by how much, which failure modes it closes. Do not label the recommendation bold. A recommendation described as bold, ambitious, or visionary, with nothing behind the words, is a small recommendation in disguise.
 
 ## What bold does not mean
 
@@ -32,23 +32,24 @@ Recommend testable outcomes. An approach that cannot be tested and is clearly un
 3. Generate candidates: the obvious approach, at least one approach that changes the shape of the problem, and one that removes the problem instead of working around it.
 4. Compare the candidates on goal coverage, novelty, iteration count, verifiability, cost, reversibility, and failure modes.
 5. Choose the boldest candidate that still passes the checks below. When the bold path carries a real risk, pair it with the measurement or fallback that makes the risk visible.
-6. Do the work in one pass. If the path needs a hill-climb, run the iterations, measure after each, and keep the best result. Do not hand back a plan and call it progress.
-7. Report what was done, what was measured, and what remains open.
+6. Write the loop out as one proposal: the iterations as far as they can be planned, the signal measured after each, the stopping condition, and the first iteration in enough detail to start. A loop handed over whole is a complete recommendation, so leaving the later iterations open is not a gap.
+7. Run the work yourself only when the user asked for the work rather than for advice. Then treat the loop as one pass, iterating and measuring inside it.
+8. Report what you proposed, what evidence sizes it, and what stays open.
 
 ## Checks before writing a recommendation
 
 - Testable: you can name the observable result and the exact check that reveals it.
 - Sized: you can say which part of the goal it reaches, in units the user cares about.
 - Non-obvious: you can explain why the obvious approach falls short.
-- Iterative where needed: the hill-climb steps and the stopping condition are written down.
-- Executed: any iterations you claim are already run, not scheduled.
+- Iterative where needed: the loop steps, the signal measured after each, and the stopping condition are written down.
+- Whole loop: the proposal covers the iterations up to the stopping condition, not only the first one.
 
 When a candidate fails the testable check, either drop it, or convert it into an experiment whose result decides between the remaining options.
 
 ## Reporting shape
 
 - Lead with the recommendation and the evidence that supports it.
-- Give the measured or measurable outcome first, the steps second.
+- Give the measurable outcome first, the loop steps second.
 - Attach each risk to the check or fallback that covers it.
 - Say plainly what stays open, and what evidence would settle it.
 
@@ -57,5 +58,6 @@ When a candidate fails the testable check, either drop it, or convert it into an
 - A plan described as bold that consists of ordinary small steps.
 - A guess about feasibility presented as a finding.
 - Novelty claimed without a comparison against the obvious approach.
-- A roadmap offered in place of the work.
+- One round of work offered as if the loop were finished.
+- An open-ended loop with no signal to measure and no stopping condition.
 - Generic advice that would apply to any project and commits to nothing.
