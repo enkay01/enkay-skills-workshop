@@ -5,4 +5,4 @@ My personal repository of skills I use for my side projects. Focused on making r
 ## Contents
 
 - `skills/`: Markdown skill definitions for Antigravity, Claude, and agent runtimes.
-  - Coming Soon
+  - `be-bold/`: Thorough analysis with recommendations that reach a large part of the goal, use a novel approach, or carry their own iterations to completion.
