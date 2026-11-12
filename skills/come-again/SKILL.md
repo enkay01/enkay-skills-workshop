@@ -1,30 +1,23 @@
 ---
 name: come-again
-description: "Repeat the previous message or explanation using clear, natural, and highly readable phrasing, and maintain these plain-language communication constraints for all future responses in the session. Trigger when the user says 'come again', 'say that again', 'rephrase that', 'say again', or invokes /come-again."
+description: "Rephrase the previous explanation in clear, natural language when the user says 'come again', 'say that again', 'rephrase that', 'say again', or invokes /come-again. Also use when explicitly asked to remove these readability patterns from supplied prose."
 ---
 
 # Come Again
 
-Immediately repeat the previous message or explanation using the communication constraints below. Continue applying these principles to every user-facing response for the remainder of the session.
+When asked to repeat an explanation, immediately rephrase the previous message using the rules below. Continue applying them to user-facing responses for the rest of the session.
 
-### Communication constraints
+When explicitly asked to edit a body of prose, revise the supplied text using the same rules. Preserve its meaning, necessary detail, technical accuracy, and intended voice. Return the revised prose unless the user asks for something else.
 
-Prioritise human comprehension over information density, stylistic novelty or minimum token count.
+## Readability rules
 
-Apply these rules to every user-facing response:
+Prioritise comprehension over brevity or stylistic novelty. Review the whole response or supplied text for these six patterns, and rewrite passages that make the reader work unnecessarily:
 
-1. Use familiar, conventional word combinations.
-2. Prefer predictable, natural English phrasing.
-3. Keep grammatically related words close together. Split sentences with long dependencies.
-4. Do not omit optional connecting words when they improve clarity.
-5. Avoid object relative clauses where a simpler sentence structure is available.
-6. Never stack three or more nouns into a compound phrase.
-7. Do not invent verbs from nouns.
-8. Do not attribute animate actions to inanimate objects. Use literal descriptions.
+1. **Noun stacks:** Unpack noun compounds of three or more nouns and state how the ideas relate. For example, replace "backup path handling" with "handling paths used for backups."
+2. **Unfamiliar word combinations:** Use familiar, conventional phrasing in place of unusual combinations that obscure the meaning.
+3. **Improvised verbs:** Do not invent verbs from nouns. Replace novel examples with the action meant; for example, use "put it on the calendar" for "calendar it."
+4. **Abstract actors:** When an abstract or inanimate thing is given a human action, identify the person or process responsible and describe the action literally.
+5. **Missing connections:** Add connecting words when they clarify the sentence. Recast object relative clauses when a simpler structure helps.
+6. **Separated sentence parts:** Keep related words, especially subjects and verbs, close together. Move interruptions or split the sentence when a long separation makes it hard to follow.
 
-**Additional requirements:**
-- Prefer simple subject–verb–object constructions.
-- Do not sacrifice clarity to reduce token count.
-- Preserve all necessary information and technical accuracy.
-- Before responding, revise sentences that violate these constraints.
-- Apply the rules without explaining them to the user.
+Prefer simple subject-verb-object sentences where they help. Revise for clarity without forcing a rewrite of familiar, natural expressions. Apply the rules without explaining them unless the user asks.
